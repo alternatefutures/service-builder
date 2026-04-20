@@ -120,7 +120,12 @@ docker push "$IMAGE_TAG"
 
 # 6. Success callback (with detected metadata).
 echo "[builder] success"
-EXTRA=$(jq -nc \
+# `-r` (raw output) is REQUIRED here. The jq expression evaluates to a STRING
+# of pre-formatted JSON key/value pairs that we splice into the heredoc with
+# a leading comma. With the default `-c` (compact JSON), jq would re-encode
+# that string with surrounding quotes and escaped inner quotes, producing
+# `,"\"imageTag\": ..."` — a JSON syntax error the API rejects with HTTP 400.
+EXTRA=$(jq -nr \
     --arg image "$IMAGE_TAG" \
     --arg sha "$ACTUAL_SHA" \
     --arg fw "$DETECTED_FRAMEWORK" \
