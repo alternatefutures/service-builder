@@ -19,6 +19,12 @@
 set -euo pipefail
 
 LOG_FILE=/tmp/build.log
+# Pre-create the log file BEFORE redirecting via process substitution.
+# `exec > >(tee -a "$LOG_FILE")` doesn't create the file until tee writes
+# its first byte, which is asynchronous — so any `tail -c "$LOG_FILE"` that
+# runs before tee flushes (e.g. the very first post_callback RUNNING) hits
+# ENOENT and, with `set -e` + the ERR trap, kills the whole build.
+: > "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 REQUIRED=(BUILD_JOB_ID CALLBACK_URL CALLBACK_TOKEN REPO_CLONE_URL REPO_REF IMAGE_TAG GHCR_USER GHCR_TOKEN)
@@ -35,8 +41,10 @@ post_callback() {
     local status="$1"
     local extra="${2:-}"
     # Truncate logs to the last ~16KB for the DB; full logs stay in the pod.
+    # `tail` failure (e.g. log file not yet flushed) must NOT abort the build,
+    # so swallow its error and fall back to an empty string.
     local logs
-    logs="$(tail -c 16000 "$LOG_FILE" | jq -Rs .)"
+    logs="$( { tail -c 16000 "$LOG_FILE" 2>/dev/null || true; } | jq -Rs .)"
     local payload
     payload=$(cat <<EOF
 {
