@@ -4,7 +4,7 @@
 # sidecar; this image does not run docker itself, it just talks to the
 # sidecar via /var/run/docker.sock.
 
-FROM node:20-bullseye-slim
+FROM node:20-bookworm-slim
 
 # System deps. We pull docker-cli (talks to the dind sidecar) and the
 # Nixpacks single-binary installer.
