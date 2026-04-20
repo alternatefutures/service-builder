@@ -118,6 +118,63 @@ echo "[builder] pushing $IMAGE_TAG to ghcr.io…"
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
 docker push "$IMAGE_TAG"
 
+# 5b. Make the GHCR package public.
+#
+# WHY: GHCR creates packages as `private` by default. Akash (and most
+# decentralized) providers' k8s pulls the image with no registry creds, so a
+# private image manifests as `ImagePullBackOff` → POLL_URLS sees the URLs but
+# 0 ready replicas → handleFailure fires → retry loop spawns N more deployments
+# all guaranteed to fail the same way. Making the package public is one PATCH
+# call and removes the entire failure mode for every current and future provider
+# without leaking creds into the SDL.
+#
+# IMAGE_TAG is always `ghcr.io/<namespace>/<package>:<tag>` (see
+# webhookEndpoint.ts → buildSpawner). We parse, then try the org endpoint
+# first (production case), falling back to the user endpoint for local /
+# self-hosted setups where the namespace is a personal account.
+#
+# Failure here is a WARNING, not fatal — the image is already pushed; the
+# only consequence is the deploy will hit the old failure mode. Operators
+# can re-run with a token that has the right scope.
+IMAGE_NO_TAG="${IMAGE_TAG%:*}"           # ghcr.io/<ns>/<pkg>
+NS_AND_PKG="${IMAGE_NO_TAG#ghcr.io/}"    # <ns>/<pkg>
+GHCR_NS="${NS_AND_PKG%%/*}"              # <ns>
+GHCR_PKG="${NS_AND_PKG#*/}"              # <pkg>
+
+echo "[builder] setting visibility=public on package ${GHCR_NS}/${GHCR_PKG}"
+ORG_CODE=$(curl -sS -o /tmp/vis.out -w "%{http_code}" -X PATCH \
+    -H "Authorization: Bearer $GHCR_TOKEN" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    --max-time 15 \
+    "https://api.github.com/orgs/${GHCR_NS}/packages/container/${GHCR_PKG}/visibility" \
+    -d '{"visibility":"public"}' || echo "000")
+
+if [ "$ORG_CODE" = "204" ]; then
+    echo "[builder] package is now public (org)"
+elif [ "$ORG_CODE" = "404" ]; then
+    # Either the package isn't indexed by GitHub yet (race after first push) OR
+    # the namespace is a user, not an org. Try the user endpoint.
+    USER_CODE=$(curl -sS -o /tmp/vis.out -w "%{http_code}" -X PATCH \
+        -H "Authorization: Bearer $GHCR_TOKEN" \
+        -H "Accept: application/vnd.github+json" \
+        -H "X-GitHub-Api-Version: 2022-11-28" \
+        --max-time 15 \
+        "https://api.github.com/user/packages/container/${GHCR_PKG}/visibility" \
+        -d '{"visibility":"public"}' || echo "000")
+    if [ "$USER_CODE" = "204" ]; then
+        echo "[builder] package is now public (user)"
+    else
+        echo "[builder] WARNING: visibility PATCH failed (org=$ORG_CODE user=$USER_CODE) — providers may not be able to pull this image"
+        head -c 500 /tmp/vis.out 2>/dev/null || true
+        echo
+    fi
+else
+    echo "[builder] WARNING: visibility PATCH returned $ORG_CODE — providers may not be able to pull this image"
+    head -c 500 /tmp/vis.out 2>/dev/null || true
+    echo
+fi
+
 # 6. Success callback (with detected metadata).
 echo "[builder] success"
 # `-r` (raw output) is REQUIRED here. The jq expression evaluates to a STRING
