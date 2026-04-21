@@ -1,0 +1,53 @@
+# af-builder (Fly variant) — single-container image that runs both
+# `dockerd` and the build script inside the same Fly Machine.
+#
+# Why a separate Dockerfile from `./Dockerfile`?
+# The K8s build path pairs a slim `node:20-bookworm` builder with a
+# privileged `docker:24-dind` sidecar. The two containers share a
+# `shareProcessNamespace: true` pod and talk over `tcp://localhost:2375`.
+#
+# Fly Machines are Firecracker microVMs, not pod-grouped containers —
+# you get one image, one root filesystem, one process tree. We need
+# `dockerd` AND the build tooling inside the same image so the script
+# can `docker build` without an external daemon. Firecracker exposes a
+# real kernel so `dockerd` works in-VM without `--privileged` shenanigans.
+#
+# Base = `docker:24-dind` (Alpine + dockerd + dockerd-entrypoint.sh).
+# We layer node, git, jq, curl, openssh-client, and Nixpacks on top.
+# `build-fly.sh` is a tiny wrapper that boots dockerd in the background,
+# waits for the unix socket, then exec's the existing `build.sh`.
+#
+# Image is published as `ghcr.io/alternatefutures/af-builder:fly-latest`
+# and MUST be PUBLIC on GHCR so Fly's Machines API can pull it without
+# carrying our org credentials around.
+
+FROM docker:24-dind
+
+# GNU tar is required: nixpacks' install.sh extracts a single binary
+# from a tarball with `tar -xzf <name>`, which busybox tar (Alpine's
+# default) chokes on with `tar: : not found in archive`. apk's `tar`
+# package shadows busybox's tar with the GNU build.
+RUN apk add --no-cache \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        gnupg \
+        jq \
+        nodejs \
+        npm \
+        openssh-client \
+        tar \
+        xz \
+    && curl -fsSL https://nixpacks.com/install.sh | bash
+
+WORKDIR /app
+COPY scripts/build.sh /app/build.sh
+COPY scripts/build-fly.sh /app/build-fly.sh
+RUN chmod +x /app/build.sh /app/build-fly.sh
+
+# Pin amd64 builds so images are portable across compute providers
+# (Akash and Phala both run amd64). Mirrors the K8s builder.
+ENV DOCKER_DEFAULT_PLATFORM=linux/amd64
+
+ENTRYPOINT ["/app/build-fly.sh"]
