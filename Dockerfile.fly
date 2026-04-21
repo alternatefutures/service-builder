@@ -41,10 +41,27 @@ RUN apk add --no-cache \
         xz \
     && curl -fsSL https://nixpacks.com/install.sh | bash
 
+# NOTE — nixpacks-base pre-bake intentionally removed.
+# We previously `skopeo copy`d ghcr.io/railwayapp/nixpacks:ubuntu-* into
+# /opt/nixpacks-base.tar and `docker load`ed it at runtime to save the
+# ~80s cold-pull tax. That only helped the default docker driver (which
+# reads dockerd's image store). build.sh now uses a `docker-container`
+# buildx driver for cross-build registry caching (which is the bigger
+# win on warm builds), and buildkit in that driver has its own image
+# store that can't see `docker load`ed images.
+#
+# Net: pre-bake was dead weight (+110MB builder image, zero runtime
+# benefit) once we pivoted to buildkit. Cold builds re-pull the base
+# (~80s, once per service); warm builds get it from the registry cache
+# (see `cache-from type=registry` in build.sh). If we ever switch back
+# to the default docker driver, restore the RUN skopeo + apk skopeo
+# lines from git history.
+
 WORKDIR /app
 COPY scripts/build.sh /app/build.sh
 COPY scripts/build-fly.sh /app/build-fly.sh
-RUN chmod +x /app/build.sh /app/build-fly.sh
+COPY scripts/render-dockerfile.sh /app/render-dockerfile.sh
+RUN chmod +x /app/build.sh /app/build-fly.sh /app/render-dockerfile.sh
 
 # Pin amd64 builds so images are portable across compute providers
 # (Akash and Phala both run amd64). Mirrors the K8s builder.

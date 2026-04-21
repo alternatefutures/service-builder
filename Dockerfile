@@ -31,7 +31,8 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY scripts/build.sh /app/build.sh
-RUN chmod +x /app/build.sh
+COPY scripts/render-dockerfile.sh /app/render-dockerfile.sh
+RUN chmod +x /app/build.sh /app/render-dockerfile.sh
 
 # Force amd64 builds inside the sidecar. Most compute providers we deploy
 # to (Akash, Phala, …) run amd64; building amd64 here means the same image

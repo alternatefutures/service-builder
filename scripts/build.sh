@@ -63,13 +63,38 @@ EOF
         || echo "[builder] WARNING: callback POST failed for status=$status (continuing)"
 }
 
-trap 'post_callback FAILED "\"errorMessage\": \"build script crashed (line $LINENO)\""' ERR
+trap 'post_callback FAILED "\"errorMessage\": \"build script crashed (line $LINENO)\""; stop_log_streamer' ERR
 
 echo "[builder] starting build_job=$BUILD_JOB_ID  ref=$REPO_REF  image=$IMAGE_TAG"
 post_callback RUNNING
 
-# 1. Wait for dind sidecar to come up.
-echo "[builder] waiting for docker daemon at $DOCKER_HOST …"
+# Background log streamer — re-POSTs the current tail of $LOG_FILE every
+# few seconds while the build runs so the UI's expandable logs viewer
+# fills in incrementally instead of staying empty until the terminal
+# callback. Status stays RUNNING; the buildCallbackEndpoint CAS gate
+# rejects any "downgrade" if a terminal callback wins the race, so this
+# is safe to leave running until just before the SUCCEEDED/FAILED post.
+LOG_STREAM_INTERVAL="${LOG_STREAM_INTERVAL:-5}"
+log_streamer() {
+    while sleep "$LOG_STREAM_INTERVAL"; do
+        post_callback RUNNING || true
+    done
+}
+log_streamer &
+LOG_STREAMER_PID=$!
+stop_log_streamer() {
+    [ -n "${LOG_STREAMER_PID:-}" ] || return 0
+    kill "$LOG_STREAMER_PID" 2>/dev/null || true
+    wait "$LOG_STREAMER_PID" 2>/dev/null || true
+    LOG_STREAMER_PID=""
+}
+
+# 1. Wait for dind sidecar (or embedded dockerd on Fly) to come up.
+# DOCKER_HOST may be unset (Fly entrypoint clears it so docker defaults to
+# the local /var/run/docker.sock); use ${VAR:-default} so `set -u` doesn't
+# crash on the bare reference. The `docker version` probe below works
+# regardless of whether DOCKER_HOST is set or not.
+echo "[builder] waiting for docker daemon at ${DOCKER_HOST:-/var/run/docker.sock} …"
 for i in {1..60}; do
     if docker version >/dev/null 2>&1; then
         echo "[builder] docker is ready"
@@ -202,18 +227,123 @@ if [ -z "$DETECTED_PORT" ] && [ "$DETECTED_FRAMEWORK" != "unknown" ]; then
     fi
 fi
 
-# 4. Build.
-NIXPACKS_ARGS=("build" "/workspace/$ROOT_DIRECTORY" "--name" "$IMAGE_TAG" "--platform" "linux/amd64")
-[ -n "${BUILD_COMMAND:-}" ] && NIXPACKS_ARGS+=("--build-cmd" "$BUILD_COMMAND")
-[ -n "${START_COMMAND:-}" ] && NIXPACKS_ARGS+=("--start-cmd" "$START_COMMAND")
+# 4. Produce the Dockerfile for this build.
+#
+# Path A (fast, default): render-dockerfile.sh emits a template tuned
+# for the detected framework — official runtime images (node:20-slim,
+# python:3.12-slim, golang:1.23-alpine, …), buildkit cache mounts for
+# the package manager dep cache, and single- or multi-stage builds
+# appropriate to the language. Cold builds finish in 60-120s instead
+# of the 6-10min nixpacks takes for the same app, mostly by NOT
+# compiling a fresh Nix environment on every Fly machine.
+#
+# Path B (fallback, rare): if the framework detector came back with
+# `unknown` OR we have no template for this language yet, we defer
+# to nixpacks the way we always did. `nixpacks build --out $SRC_DIR`
+# drops `.nixpacks/Dockerfile` in place and we continue from there.
+# Zero regression risk for exotic repos.
+#
+# Escape hatches in either path:
+#   - $BUILD_COMMAND / $START_COMMAND env vars override the defaults
+#   - A committed $SRC_DIR/Dockerfile is picked up by framework=docker
+#     (the template for that just re-emits `FROM $IMAGE` style — not
+#     yet implemented; today `docker` falls through to nixpacks which
+#     handles it gracefully)
+USE_TEMPLATE=1
+TEMPLATE_PATH="$SRC_DIR/.af/Dockerfile"
+mkdir -p "$SRC_DIR/.af"
+if SRC_DIR="$SRC_DIR" BUILD_COMMAND="${BUILD_COMMAND:-}" START_COMMAND="${START_COMMAND:-}" \
+        DETECTED_PORT="${DETECTED_PORT:-}" \
+        /app/render-dockerfile.sh "$DETECTED_FRAMEWORK" >"$TEMPLATE_PATH" 2>>"$LOG_FILE"; then
+    echo "[builder] using template Dockerfile (framework=$DETECTED_FRAMEWORK)"
+    DOCKERFILE_PATH="$TEMPLATE_PATH"
+else
+    USE_TEMPLATE=0
+    echo "[builder] no template for framework=$DETECTED_FRAMEWORK — falling back to nixpacks"
+    NIXPACKS_ARGS=("build" "$SRC_DIR" "--name" "$IMAGE_TAG" "--platform" "linux/amd64" "--out" "$SRC_DIR")
+    [ -n "${BUILD_COMMAND:-}" ] && NIXPACKS_ARGS+=("--build-cmd" "$BUILD_COMMAND")
+    [ -n "${START_COMMAND:-}" ] && NIXPACKS_ARGS+=("--start-cmd" "$START_COMMAND")
 
-echo "[builder] running: nixpacks ${NIXPACKS_ARGS[*]}"
-nixpacks "${NIXPACKS_ARGS[@]}"
+    echo "[builder] planning with: nixpacks ${NIXPACKS_ARGS[*]}"
+    nixpacks "${NIXPACKS_ARGS[@]}"
 
-# 5. Push.
-echo "[builder] pushing $IMAGE_TAG to ghcr.io…"
+    if [ ! -f "$SRC_DIR/.nixpacks/Dockerfile" ]; then
+        echo "[builder] ERROR: nixpacks produced no Dockerfile at $SRC_DIR/.nixpacks/Dockerfile" >&2
+        exit 66
+    fi
+    DOCKERFILE_PATH="$SRC_DIR/.nixpacks/Dockerfile"
+fi
+
+# Log in to GHCR up front so both the cache import and the image push
+# below can talk to `ghcr.io/<namespace>/*` without extra auth steps.
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
-docker push "$IMAGE_TAG"
+
+# ---------------------------------------------------------------------------
+# Cross-build layer cache via GHCR
+# ---------------------------------------------------------------------------
+# Cache ref = same GHCR repo as the image output, pinned to the reserved
+# `:buildcache` tag. One cache per service; different services can't
+# poison each other's layers. Reuses the same auth token we already
+# have for the image push — no extra credentials to plumb.
+#
+# Why the `docker-container` buildx driver (and not the default docker
+# driver with DOCKER_BUILDKIT=1)?
+# We tried the default driver first. It worked up until the `COPY . /app/.`
+# step, at which point buildkit's embedded snapshotter kept dying with
+#   failed to prepare <id> as <id>: invalid argument
+# under `#11 COPY . /app/.` on Fly's overlay2 storage. The reproducer
+# was stable: every Fly build with the default driver + a `docker load`ed
+# base image (see build-fly.sh) hit this, roughly equivalent to
+# moby/buildkit#3111. Switching to a `docker-container` buildx driver
+# puts buildkit in its own sibling container with its OWN snapshotter,
+# which removes the conflict.
+#
+# Trade-off: docker-container driver's buildkit has a clean image store,
+# so it re-pulls the nixpacks base from the registry (~80s) instead of
+# reading our pre-baked `docker load`ed copy. We recover that on the
+# SECOND build — the registry cache pushed below captures the base
+# layer refs, so buildkit's next run hits them without re-pulling.
+#
+# First build for a service is cold (cache-from gets a 404 which buildkit
+# treats as "no cache", completes normally and populates the cache on
+# push). Second+ builds import the cache manifest (~2-5s) and layer-hit
+# everything up to the point where the source content changed — typically
+# reduces a 6-10min build to ~60-90s.
+CACHE_REF="${IMAGE_TAG%:*}:buildcache"
+
+# Bootstrap a docker-container buildx builder once per machine. Reusing
+# an existing builder is free; creating one pulls moby/buildkit (~100MB)
+# and takes ~10s. Machines are ephemeral so this is first-run only.
+if ! docker buildx inspect af-cache >/dev/null 2>&1; then
+    echo "[builder] creating buildx builder 'af-cache' (docker-container driver)…"
+    docker buildx create \
+        --name af-cache \
+        --driver docker-container \
+        --driver-opt 'image=moby/buildkit:buildx-stable-1' \
+        --driver-opt 'network=host' \
+        --bootstrap \
+        >/dev/null
+fi
+
+echo "[builder] running: docker buildx build (cache-from/to=$CACHE_REF, mode=max)"
+# `--push` publishes the image in the same step (replaces the separate
+# docker push that the old, nixpacks-driven flow had). Pushing via
+# buildkit is also what lets us use `cache-to type=registry,mode=max` —
+# mode=max uploads ALL intermediate layer refs (not just the final
+# manifest's), which is the difference between a warm rebuild cache
+# hit rate of ~95% and ~30%.
+#
+# `ignore-error=true` on cache-to: a cache push failure never fails
+# the build. The image still shipped; next build is just cold.
+docker buildx build \
+    --builder af-cache \
+    --file "$DOCKERFILE_PATH" \
+    --platform linux/amd64 \
+    --tag "$IMAGE_TAG" \
+    --cache-from "type=registry,ref=$CACHE_REF" \
+    --cache-to "type=registry,ref=$CACHE_REF,mode=max,ignore-error=true" \
+    --push \
+    "$SRC_DIR"
 
 # 5b. Make the GHCR package public.
 #
@@ -285,6 +415,10 @@ EXTRA=$(jq -nr \
     --arg fw "$DETECTED_FRAMEWORK" \
     --arg port "${DETECTED_PORT:-}" \
     '{imageTag:$image, commitSha:$sha, detectedFramework:$fw} + (if $port == "" then {} else {detectedPort: ($port|tonumber? // null)} end) | to_entries | map("\"\(.key)\": \(.value | @json)") | join(",")')
+# Stop the streamer BEFORE the terminal callback so a late RUNNING tick
+# never races a SUCCEEDED. The CAS gate would reject a downgrade anyway,
+# but draining cleanly avoids a 200-with-ignored noise log on the API.
+stop_log_streamer
 post_callback SUCCEEDED "$EXTRA"
 
 trap - ERR
