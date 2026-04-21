@@ -93,19 +93,92 @@ git -C /workspace checkout -q FETCH_HEAD
 ACTUAL_SHA=$(git -C /workspace rev-parse HEAD)
 echo "[builder] checked out $ACTUAL_SHA"
 
-# 3. Detect via nixpacks plan (best-effort; failure is non-fatal — build will surface real errors).
+# 3. Framework detection — primary source: the manifest the user wrote.
+#
+# We used to delegate this to `nixpacks plan`, but nixpacks is a builder
+# (optimized for "compile & bundle"), not an introspector. It exits non-zero
+# on common ambiguities — multiple lockfiles (npm + pnpm), Dockerfile-only
+# repos, monorepos — and our prior `2>/dev/null` swallowed that error,
+# leaving framework="unknown" forever. Reading the project manifest
+# directly is deterministic, takes <100ms, and works for every repo whose
+# author declared their dependencies (i.e. all of them).
+#
+# Order matters: pick the most specific framework before falling back to
+# the runtime label. e.g. `next` beats `node` even though both are present.
+SRC_DIR="/workspace/$ROOT_DIRECTORY"
 DETECTED_FRAMEWORK="unknown"
 DETECTED_PORT=""
-if PLAN_JSON=$(nixpacks plan "/workspace/$ROOT_DIRECTORY" --format json 2>/dev/null); then
-    DETECTED_FRAMEWORK=$(echo "$PLAN_JSON" | jq -r '.providers[0] // "unknown"')
-    # Some providers expose start variables; we don't pretend we always know the port.
-    DETECTED_PORT=$(echo "$PLAN_JSON" | jq -r '.variables.PORT // empty')
-    echo "[builder] nixpacks detected provider=$DETECTED_FRAMEWORK  port=${DETECTED_PORT:-<unset>}"
+
+# Helper — true iff the named npm package is in dependencies or devDependencies.
+has_npm_dep() {
+    local pkg="$1"
+    [ -f "$SRC_DIR/package.json" ] || return 1
+    jq -e --arg p "$pkg" \
+        '((.dependencies // {}) + (.devDependencies // {})) | has($p)' \
+        "$SRC_DIR/package.json" >/dev/null 2>&1
+}
+
+if [ -f "$SRC_DIR/package.json" ]; then
+    if   has_npm_dep "next";              then DETECTED_FRAMEWORK="next"
+    elif has_npm_dep "nuxt";              then DETECTED_FRAMEWORK="nuxt"
+    elif has_npm_dep "@remix-run/dev"     \
+      || has_npm_dep "@remix-run/serve";  then DETECTED_FRAMEWORK="remix"
+    elif has_npm_dep "astro";             then DETECTED_FRAMEWORK="astro"
+    elif has_npm_dep "@sveltejs/kit";     then DETECTED_FRAMEWORK="sveltekit"
+    elif has_npm_dep "svelte";            then DETECTED_FRAMEWORK="svelte"
+    elif has_npm_dep "vite";              then DETECTED_FRAMEWORK="vite"
+    elif has_npm_dep "@nestjs/core";      then DETECTED_FRAMEWORK="nestjs"
+    elif has_npm_dep "express"            \
+      || has_npm_dep "fastify"            \
+      || has_npm_dep "koa"                \
+      || has_npm_dep "hono";              then DETECTED_FRAMEWORK="node"
+    else                                       DETECTED_FRAMEWORK="node"
+    fi
+elif [ -f "$SRC_DIR/Cargo.toml" ];        then DETECTED_FRAMEWORK="rust"
+elif [ -f "$SRC_DIR/go.mod" ];            then DETECTED_FRAMEWORK="go"
+elif [ -f "$SRC_DIR/pyproject.toml" ] || [ -f "$SRC_DIR/requirements.txt" ]; then
+    if   grep -qiE '^django'   "$SRC_DIR/requirements.txt" 2>/dev/null \
+      || grep -qiE 'django'    "$SRC_DIR/pyproject.toml"   2>/dev/null; then DETECTED_FRAMEWORK="django"
+    elif grep -qiE '^fastapi'  "$SRC_DIR/requirements.txt" 2>/dev/null \
+      || grep -qiE 'fastapi'   "$SRC_DIR/pyproject.toml"   2>/dev/null; then DETECTED_FRAMEWORK="fastapi"
+    elif grep -qiE '^flask'    "$SRC_DIR/requirements.txt" 2>/dev/null \
+      || grep -qiE 'flask'     "$SRC_DIR/pyproject.toml"   2>/dev/null; then DETECTED_FRAMEWORK="flask"
+    else                                                                    DETECTED_FRAMEWORK="python"
+    fi
+elif [ -f "$SRC_DIR/Gemfile" ]; then
+    if grep -qE '^[^#]*gem .rails.' "$SRC_DIR/Gemfile" 2>/dev/null; then DETECTED_FRAMEWORK="rails"
+    else                                                                 DETECTED_FRAMEWORK="ruby"
+    fi
+elif [ -f "$SRC_DIR/composer.json" ]; then
+    if jq -e '((.["require"] // {}) + (.["require-dev"] // {})) | has("laravel/framework")' \
+        "$SRC_DIR/composer.json" >/dev/null 2>&1; then DETECTED_FRAMEWORK="laravel"
+    else                                               DETECTED_FRAMEWORK="php"
+    fi
+elif [ -f "$SRC_DIR/pom.xml" ] || [ -f "$SRC_DIR/build.gradle" ] || [ -f "$SRC_DIR/build.gradle.kts" ]; then
+    if   grep -qiE 'spring-boot' "$SRC_DIR/pom.xml" 2>/dev/null \
+      || grep -qiE 'spring-boot' "$SRC_DIR/build.gradle" 2>/dev/null \
+      || grep -qiE 'spring-boot' "$SRC_DIR/build.gradle.kts" 2>/dev/null; then DETECTED_FRAMEWORK="spring"
+    else                                                                       DETECTED_FRAMEWORK="java"
+    fi
+elif [ -f "$SRC_DIR/deno.json" ] || [ -f "$SRC_DIR/deno.jsonc" ]; then DETECTED_FRAMEWORK="deno"
+elif [ -f "$SRC_DIR/Dockerfile" ];                                     then DETECTED_FRAMEWORK="docker"
+fi
+echo "[builder] manifest-based detection: framework=$DETECTED_FRAMEWORK"
+
+# Optional enrichment — ask nixpacks for the port hint, but NEVER let it
+# overwrite the framework label we just determined from the manifest.
+# Nixpacks's stderr is too useful for debugging silent failures to keep
+# swallowing it; route it into the build log so it's visible in the UI.
+if PLAN_JSON=$(nixpacks plan "$SRC_DIR" --format json 2>>"$LOG_FILE"); then
+    PLAN_PORT=$(echo "$PLAN_JSON" | jq -r '.variables.PORT // empty')
+    PLAN_PROVIDER=$(echo "$PLAN_JSON" | jq -r '.providers[0] // "unknown"')
+    [ -n "$PLAN_PORT" ] && DETECTED_PORT="$PLAN_PORT"
+    echo "[builder] nixpacks plan: provider=$PLAN_PROVIDER port=${PLAN_PORT:-<unset>} (used as enrichment only)"
 else
-    echo "[builder] nixpacks plan failed (continuing — build will fail loudly if framework is unsupported)"
+    echo "[builder] nixpacks plan failed (non-fatal; manifest-based framework already set; see log above for stderr)"
 fi
 
-# Framework-default port fallback. Nixpacks reports `variables.PORT` for ~10%
+# Framework-default port fallback. nixpacks reports `variables.PORT` for ~10%
 # of providers (the ones with explicit `--start-cmd ... --port $PORT`-style
 # scaffolding). Most provider plans omit it because the convention is
 # `process.env.PORT` at runtime — leaving DETECTED_PORT empty here would
@@ -113,15 +186,19 @@ fi
 # falls back to in its own way (see akash/orchestrator.ts). We pre-empt that
 # with a per-framework default so the public URL serves HTML instead of 404
 # on first deploy. Users can always override via Config → Container port.
+# Keep this table in lockstep with:
+#   service-cloud-api/src/services/akash/orchestrator.ts   (SDL fallback)
+#   web-app.alternatefutures.ai/.../GithubSourceSection.tsx (UI hint)
 if [ -z "$DETECTED_PORT" ] && [ "$DETECTED_FRAMEWORK" != "unknown" ]; then
     case "$DETECTED_FRAMEWORK" in
-        node|next|nextjs|nuxt|remix|astro|svelte|sveltekit|bun|rails|ruby) DETECTED_PORT=3000 ;;
-        vite)                                                              DETECTED_PORT=5173 ;;
-        deno|python|django|fastapi|flask|php|laravel)                      DETECTED_PORT=8000 ;;
-        rust|go|java|spring)                                               DETECTED_PORT=8080 ;;
+        node|next|nextjs|nuxt|remix|astro|svelte|sveltekit|nestjs|bun|rails|ruby) DETECTED_PORT=3000 ;;
+        vite)                                                                     DETECTED_PORT=5173 ;;
+        deno|python|django|fastapi|flask|php|laravel)                             DETECTED_PORT=8000 ;;
+        rust|go|java|spring)                                                      DETECTED_PORT=8080 ;;
+        docker)                                                                   DETECTED_PORT=80   ;;
     esac
     if [ -n "$DETECTED_PORT" ]; then
-        echo "[builder] no port in plan; defaulting to $DETECTED_PORT for provider=$DETECTED_FRAMEWORK"
+        echo "[builder] no port from nixpacks; defaulting to $DETECTED_PORT for framework=$DETECTED_FRAMEWORK"
     fi
 fi
 
