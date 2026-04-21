@@ -105,6 +105,26 @@ else
     echo "[builder] nixpacks plan failed (continuing — build will fail loudly if framework is unsupported)"
 fi
 
+# Framework-default port fallback. Nixpacks reports `variables.PORT` for ~10%
+# of providers (the ones with explicit `--start-cmd ... --port $PORT`-style
+# scaffolding). Most provider plans omit it because the convention is
+# `process.env.PORT` at runtime — leaving DETECTED_PORT empty here would
+# propagate as `Service.containerPort=null`, which the SDL generator then
+# falls back to in its own way (see akash/orchestrator.ts). We pre-empt that
+# with a per-framework default so the public URL serves HTML instead of 404
+# on first deploy. Users can always override via Config → Container port.
+if [ -z "$DETECTED_PORT" ] && [ "$DETECTED_FRAMEWORK" != "unknown" ]; then
+    case "$DETECTED_FRAMEWORK" in
+        node|next|nextjs|nuxt|remix|astro|svelte|sveltekit|bun|rails|ruby) DETECTED_PORT=3000 ;;
+        vite)                                                              DETECTED_PORT=5173 ;;
+        deno|python|django|fastapi|flask|php|laravel)                      DETECTED_PORT=8000 ;;
+        rust|go|java|spring)                                               DETECTED_PORT=8080 ;;
+    esac
+    if [ -n "$DETECTED_PORT" ]; then
+        echo "[builder] no port in plan; defaulting to $DETECTED_PORT for provider=$DETECTED_FRAMEWORK"
+    fi
+fi
+
 # 4. Build.
 NIXPACKS_ARGS=("build" "/workspace/$ROOT_DIRECTORY" "--name" "$IMAGE_TAG" "--platform" "linux/amd64")
 [ -n "${BUILD_COMMAND:-}" ] && NIXPACKS_ARGS+=("--build-cmd" "$BUILD_COMMAND")
