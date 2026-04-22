@@ -279,61 +279,95 @@ fi
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
 
 # ---------------------------------------------------------------------------
-# Build driver choice + cache strategy (Phase 1)
+# Build driver choice + cache strategy (Phase 2: registry cache-to)
 # ---------------------------------------------------------------------------
-# We use the default `docker` buildx driver (buildkit embedded in
-# dockerd) so ALL buildkit state — snapshotter, `--mount=type=cache`
-# dirs, pulled base images — lives under `dockerd --data-root`. In
-# build-fly.sh we point data-root at the mounted Fly Volume when one
-# is attached, which turns the whole thing into a persistent cache
-# across machine reaps.
+# We use a `docker-container` buildx driver with a deterministic builder
+# name (`af-buildkit`) so we can push a full registry cache on every
+# build (`type=registry,mode=max`). The default `docker` driver doesn't
+# support `mode=max` cache-to — only `type=inline`, which collapses
+# multi-stage builders (Go, Rust, Nixpacks) into a single cached stage
+# and silently under-caches those builds.
 #
-# Why default driver and not docker-container?
-#   - docker-container buildkit has its own snapshotter inside the
-#     sibling container; that state doesn't survive machine reaps and
-#     we'd need to mount the volume INTO that container (not cleanly
-#     supported by `docker buildx create`).
-#   - The default driver's old "invalid argument" bug at COPY . /app
-#     was triggered specifically by `docker load`ing a pre-baked base
-#     on Fly's overlay2. We stopped pre-baking in Phase 0; the trigger
-#     is gone.
+# Why this still persists across machine reaps:
+#   - `docker buildx create --driver docker-container` spawns a sibling
+#     container named `buildx_buildkit_<builder>0`. That container's
+#     metadata + overlay2 layer live under dockerd's data-root.
+#   - build-fly.sh points `dockerd --data-root` at the mounted Fly
+#     Volume, so the buildkit sibling container + its snapshotter
+#     state + its `--mount=type=cache` dirs are all on the volume.
+#   - When a new machine attaches the same volume, `docker buildx
+#     inspect af-buildkit` finds the existing container and reuses it
+#     verbatim. Same warm pnpm store, same Python wheels, same
+#     node_modules layers.
 #
-# Registry cache-from (the `:buildcache` GHCR tag) is still pulled on
-# cold machines — it's how brand-new machine #1 of a new service gets
-# warm. cache-to is dropped because the default driver doesn't support
-# `type=registry,mode=max` (only `type=inline`, which is weak for the
-# multi-stage templates). We'll reintroduce cross-machine cache export
-# in Phase 4 (R2-backed `type=s3`).
+# Cross-machine warmup for brand-new volumes (or a freshly-reaped
+# machine where the buildkit container got GC'd):
+#   - `--cache-to type=registry,ref=$CACHE_REF,mode=max` pushes every
+#     intermediate stage's cache to `ghcr.io/.../:buildcache`.
+#   - `--cache-from type=registry,ref=$CACHE_REF` pulls it back on
+#     first-ever builds. Even a completely cold volume warms up on
+#     the first build after priming.
 #
 # Net behavior:
-#   - First-ever build on empty volume: cold, ~2-3min.
+#   - First-ever build on empty volume (pre-prime): ~3-4 min (base
+#     image pull + dep install).
+#   - First-ever build on primed volume: ~60-90s (skips apt + base
+#     pulls because prime-cache.sh wrote them to the volume).
 #   - Second build of same service, same deps, SAME machine: ~15-30s.
-#   - Second build of different service on same machine: ~30-60s
-#     (base image already warm; pnpm store shared via cache mounts).
+#   - First build after a machine reap / zone migration: ~60-90s
+#     (hydrates from :buildcache even if the volume was lost).
 CACHE_REF="${IMAGE_TAG%:*}:buildcache"
+BUILDX_BUILDER="${BUILDX_BUILDER:-af-buildkit}"
 
-echo "[builder] running: docker buildx build (cache-from=$CACHE_REF, driver=default, volume=${AF_CACHE_ROOT:-<ephemeral>})"
-# `--push` publishes the image in the same step (replaces the separate
-# docker push that the old, nixpacks-driven flow had).
+# Idempotent builder creation. `inspect` returns non-zero when the
+# builder doesn't exist OR when it exists but has no backing container
+# (GC'd); `create` is a no-op if the named builder already exists, so
+# we try `use` first and only `create` on a clean miss. This keeps
+# fresh-volume bootstrap working without a separate init step.
+if ! docker buildx use "$BUILDX_BUILDER" >/dev/null 2>&1; then
+    echo "[builder] creating docker-container buildx builder: $BUILDX_BUILDER"
+    docker buildx create \
+        --driver docker-container \
+        --name "$BUILDX_BUILDER" \
+        --use \
+        --bootstrap >/dev/null
+else
+    echo "[builder] reusing existing buildx builder: $BUILDX_BUILDER"
+fi
+
+# BuildKit inside the sibling container needs DNS for registry pulls
+# during `--cache-from`. We already pass --dns to dockerd in
+# build-fly.sh, but the buildx container inherits its own resolv.conf
+# at create time — on older buildx this can be empty. Print the current
+# builder config to the log so DNS misconfigs show up immediately
+# instead of manifesting as "no cache available".
+docker buildx inspect "$BUILDX_BUILDER" --bootstrap | sed 's/^/[builder] buildx: /' || true
+
+echo "[builder] running: docker buildx build (cache-from+to=$CACHE_REF, driver=docker-container, volume=${AF_CACHE_ROOT:-<ephemeral>})"
+# `--push` publishes the image in the same step (the docker-container
+# driver doesn't populate dockerd's local image store, so we must
+# --push or --load explicitly; --push is what we want anyway).
 #
-# Cache-from with `ignore-error=true` via buildkit env var (there's no
-# CLI flag for it on the default driver but the import is a best-effort
-# operation — a 404 just means "no cache yet", buildkit handles it).
+# --cache-to mode=max: exports ALL intermediate stages' caches to the
+# registry, not just the final stage. Essential for multi-stage Rust/Go
+# templates and for the Nixpacks fallback (nixpacks Dockerfiles tend to
+# stack 5-10 deps/build/prod stages and only the final stage would
+# round-trip on `mode=min`).
+#
+# ignore-error=true on cache-to: if the registry is temporarily
+# unreachable or GHCR returns 5xx on the PUT, don't fail the build
+# itself. Cache-to is an optimization, not a correctness requirement.
 #
 # --label org.opencontainers.image.source: stamped so GHCR auto-links
-# this container package to the source GitHub repo on push. Without
-# the linked repo, the REST API for changing package visibility returns
-# 404 for ANY target value (confirmed by reproducing with a token that
-# had the correct scopes + org admin role — same 404). Linking is the
-# only path that unlocks the PATCH below. Label value is the clean
-# https URL (no auth token), so it's safe to embed in a manifest that
-# may end up in a public image.
+# this container package to the source GitHub repo on push. Label
+# value is the clean https URL (no auth token), safe to embed.
 #
 # image.revision / image.created are included because `docker inspect`
 # on a deployed service should tell you exactly which commit built it
 # without cross-referencing BuildJob rows.
 BUILD_START_MS=$(date +%s%3N)
-DOCKER_BUILDKIT=1 docker buildx build \
+docker buildx build \
+    --builder "$BUILDX_BUILDER" \
     --file "$DOCKERFILE_PATH" \
     --platform linux/amd64 \
     --tag "$IMAGE_TAG" \
@@ -341,6 +375,7 @@ DOCKER_BUILDKIT=1 docker buildx build \
     --label "org.opencontainers.image.revision=$REPO_REF" \
     --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --cache-from "type=registry,ref=$CACHE_REF" \
+    --cache-to "type=registry,ref=$CACHE_REF,mode=max,ignore-error=true" \
     --push \
     "$SRC_DIR"
 BUILD_END_MS=$(date +%s%3N)

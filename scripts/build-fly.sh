@@ -92,4 +92,63 @@ done
 # cache stats in the per-build telemetry line.
 unset DOCKER_HOST
 export AF_CACHE_ROOT="${AF_CACHE_ROOT:-}"
-exec /app/build.sh
+
+# ---------------------------------------------------------------------------
+# Hard runtime cap.
+# ---------------------------------------------------------------------------
+# Enforced here, not inside build.sh, because build.sh has its own
+# ERR trap that will not fire on SIGTERM from `timeout`. Wrapping from
+# the outer script lets us intercept the 124/137 exit codes, post a
+# clean FAILED callback to service-cloud-api (otherwise the BuildJob
+# would sit as RUNNING forever once the machine auto-destroys), then
+# exit non-zero so Fly reaps the VM.
+#
+# Defaults:
+#   AF_BUILD_TIMEOUT_SECONDS — 15 min. A real Next.js cold build is
+#     ~3-4 min; anything past 15 is almost certainly a runaway user
+#     script (infinite build loop, memory thrash, OOM reboot storm).
+#     Cap corresponds to ~$0.09 of Fly compute at performance-8x.
+#   TIMEOUT_KILL_GRACE — 30s of SIGTERM → SIGKILL grace so dockerd/
+#     buildkit get a chance to flush their metadata back to the volume
+#     cleanly instead of leaving a half-written snapshotter state.
+AF_BUILD_TIMEOUT_SECONDS="${AF_BUILD_TIMEOUT_SECONDS:-900}"
+TIMEOUT_KILL_GRACE="${TIMEOUT_KILL_GRACE:-30}"
+
+echo "[build-fly] running /app/build.sh with timeout=${AF_BUILD_TIMEOUT_SECONDS}s (kill-after=${TIMEOUT_KILL_GRACE}s)"
+
+set +e
+timeout --signal=TERM --kill-after="${TIMEOUT_KILL_GRACE}s" \
+    "${AF_BUILD_TIMEOUT_SECONDS}s" /app/build.sh
+rc=$?
+set -e
+
+# 124 = timeout expired, child exited on TERM.
+# 137 = timeout expired, child had to be SIGKILLed after grace.
+# Both mean the build was force-killed by us.
+if [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+    echo "[build-fly] ERROR: build.sh exceeded ${AF_BUILD_TIMEOUT_SECONDS}s cap — posting FAILED callback" >&2
+    # Guard against missing callback env. This is the "stuck machine"
+    # failure mode we're fixing; if the callback envs aren't set (e.g.
+    # running in a prime-cache context) there's nothing to post.
+    if [ -n "${CALLBACK_URL:-}" ] && [ -n "${CALLBACK_TOKEN:-}" ] && [ -n "${BUILD_JOB_ID:-}" ]; then
+        # Best-effort POST; never let the callback itself wedge the exit path.
+        payload=$(jq -nc \
+            --arg id "$BUILD_JOB_ID" \
+            --arg cap "$AF_BUILD_TIMEOUT_SECONDS" \
+            --arg rc "$rc" \
+            '{
+                buildJobId: $id,
+                status: "FAILED",
+                logs: "[build-fly] build exceeded \($cap)s runtime cap (exit=\($rc)) — killed by watchdog",
+                errorMessage: "build exceeded \($cap)s runtime cap"
+             }')
+        curl -fsS -X POST "$CALLBACK_URL" \
+            -H "Content-Type: application/json" \
+            -H "X-AF-Build-Token: $CALLBACK_TOKEN" \
+            --max-time 30 \
+            -d "$payload" >/dev/null \
+            || echo "[build-fly] WARNING: timeout-FAILED callback POST failed (continuing)" >&2
+    fi
+fi
+
+exit $rc
