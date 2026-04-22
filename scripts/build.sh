@@ -27,7 +27,7 @@ LOG_FILE=/tmp/build.log
 : > "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-REQUIRED=(BUILD_JOB_ID CALLBACK_URL CALLBACK_TOKEN REPO_CLONE_URL REPO_REF IMAGE_TAG GHCR_USER GHCR_TOKEN)
+REQUIRED=(BUILD_JOB_ID CALLBACK_URL CALLBACK_TOKEN REPO_CLONE_URL REPO_REF IMAGE_TAG GHCR_USER GHCR_TOKEN REPO_SOURCE_URL REPO_OWNER REPO_NAME)
 for v in "${REQUIRED[@]}"; do
     if [ -z "${!v:-}" ]; then
         echo "[builder] missing required env: $v" >&2
@@ -279,128 +279,126 @@ fi
 echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
 
 # ---------------------------------------------------------------------------
-# Cross-build layer cache via GHCR
+# Build driver choice + cache strategy (Phase 1)
 # ---------------------------------------------------------------------------
-# Cache ref = same GHCR repo as the image output, pinned to the reserved
-# `:buildcache` tag. One cache per service; different services can't
-# poison each other's layers. Reuses the same auth token we already
-# have for the image push — no extra credentials to plumb.
+# We use the default `docker` buildx driver (buildkit embedded in
+# dockerd) so ALL buildkit state — snapshotter, `--mount=type=cache`
+# dirs, pulled base images — lives under `dockerd --data-root`. In
+# build-fly.sh we point data-root at the mounted Fly Volume when one
+# is attached, which turns the whole thing into a persistent cache
+# across machine reaps.
 #
-# Why the `docker-container` buildx driver (and not the default docker
-# driver with DOCKER_BUILDKIT=1)?
-# We tried the default driver first. It worked up until the `COPY . /app/.`
-# step, at which point buildkit's embedded snapshotter kept dying with
-#   failed to prepare <id> as <id>: invalid argument
-# under `#11 COPY . /app/.` on Fly's overlay2 storage. The reproducer
-# was stable: every Fly build with the default driver + a `docker load`ed
-# base image (see build-fly.sh) hit this, roughly equivalent to
-# moby/buildkit#3111. Switching to a `docker-container` buildx driver
-# puts buildkit in its own sibling container with its OWN snapshotter,
-# which removes the conflict.
+# Why default driver and not docker-container?
+#   - docker-container buildkit has its own snapshotter inside the
+#     sibling container; that state doesn't survive machine reaps and
+#     we'd need to mount the volume INTO that container (not cleanly
+#     supported by `docker buildx create`).
+#   - The default driver's old "invalid argument" bug at COPY . /app
+#     was triggered specifically by `docker load`ing a pre-baked base
+#     on Fly's overlay2. We stopped pre-baking in Phase 0; the trigger
+#     is gone.
 #
-# Trade-off: docker-container driver's buildkit has a clean image store,
-# so it re-pulls the nixpacks base from the registry (~80s) instead of
-# reading our pre-baked `docker load`ed copy. We recover that on the
-# SECOND build — the registry cache pushed below captures the base
-# layer refs, so buildkit's next run hits them without re-pulling.
+# Registry cache-from (the `:buildcache` GHCR tag) is still pulled on
+# cold machines — it's how brand-new machine #1 of a new service gets
+# warm. cache-to is dropped because the default driver doesn't support
+# `type=registry,mode=max` (only `type=inline`, which is weak for the
+# multi-stage templates). We'll reintroduce cross-machine cache export
+# in Phase 4 (R2-backed `type=s3`).
 #
-# First build for a service is cold (cache-from gets a 404 which buildkit
-# treats as "no cache", completes normally and populates the cache on
-# push). Second+ builds import the cache manifest (~2-5s) and layer-hit
-# everything up to the point where the source content changed — typically
-# reduces a 6-10min build to ~60-90s.
+# Net behavior:
+#   - First-ever build on empty volume: cold, ~2-3min.
+#   - Second build of same service, same deps, SAME machine: ~15-30s.
+#   - Second build of different service on same machine: ~30-60s
+#     (base image already warm; pnpm store shared via cache mounts).
 CACHE_REF="${IMAGE_TAG%:*}:buildcache"
 
-# Bootstrap a docker-container buildx builder once per machine. Reusing
-# an existing builder is free; creating one pulls moby/buildkit (~100MB)
-# and takes ~10s. Machines are ephemeral so this is first-run only.
-if ! docker buildx inspect af-cache >/dev/null 2>&1; then
-    echo "[builder] creating buildx builder 'af-cache' (docker-container driver)…"
-    docker buildx create \
-        --name af-cache \
-        --driver docker-container \
-        --driver-opt 'image=moby/buildkit:buildx-stable-1' \
-        --driver-opt 'network=host' \
-        --bootstrap \
-        >/dev/null
-fi
-
-echo "[builder] running: docker buildx build (cache-from/to=$CACHE_REF, mode=max)"
+echo "[builder] running: docker buildx build (cache-from=$CACHE_REF, driver=default, volume=${AF_CACHE_ROOT:-<ephemeral>})"
 # `--push` publishes the image in the same step (replaces the separate
-# docker push that the old, nixpacks-driven flow had). Pushing via
-# buildkit is also what lets us use `cache-to type=registry,mode=max` —
-# mode=max uploads ALL intermediate layer refs (not just the final
-# manifest's), which is the difference between a warm rebuild cache
-# hit rate of ~95% and ~30%.
+# docker push that the old, nixpacks-driven flow had).
 #
-# `ignore-error=true` on cache-to: a cache push failure never fails
-# the build. The image still shipped; next build is just cold.
-docker buildx build \
-    --builder af-cache \
+# Cache-from with `ignore-error=true` via buildkit env var (there's no
+# CLI flag for it on the default driver but the import is a best-effort
+# operation — a 404 just means "no cache yet", buildkit handles it).
+#
+# --label org.opencontainers.image.source: stamped so GHCR auto-links
+# this container package to the source GitHub repo on push. Without
+# the linked repo, the REST API for changing package visibility returns
+# 404 for ANY target value (confirmed by reproducing with a token that
+# had the correct scopes + org admin role — same 404). Linking is the
+# only path that unlocks the PATCH below. Label value is the clean
+# https URL (no auth token), so it's safe to embed in a manifest that
+# may end up in a public image.
+#
+# image.revision / image.created are included because `docker inspect`
+# on a deployed service should tell you exactly which commit built it
+# without cross-referencing BuildJob rows.
+BUILD_START_MS=$(date +%s%3N)
+DOCKER_BUILDKIT=1 docker buildx build \
     --file "$DOCKERFILE_PATH" \
     --platform linux/amd64 \
     --tag "$IMAGE_TAG" \
+    --label "org.opencontainers.image.source=$REPO_SOURCE_URL" \
+    --label "org.opencontainers.image.revision=$REPO_REF" \
+    --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --cache-from "type=registry,ref=$CACHE_REF" \
-    --cache-to "type=registry,ref=$CACHE_REF,mode=max,ignore-error=true" \
     --push \
     "$SRC_DIR"
+BUILD_END_MS=$(date +%s%3N)
+BUILD_DURATION_MS=$((BUILD_END_MS - BUILD_START_MS))
 
-# 5b. Make the GHCR package public.
+# ---------------------------------------------------------------------------
+# Per-build telemetry JSON line.
+# ---------------------------------------------------------------------------
+# One-line JSON blob printed to stdout (and captured in $LOG_FILE so it
+# makes it back to the callback POST). Phase 5 will tee this into
+# Datadog/Prometheus, but even today it gives us grep-able
+# "was this build warm or cold?" data without a dashboard.
 #
-# WHY: GHCR creates packages as `private` by default. Akash (and most
-# decentralized) providers' k8s pulls the image with no registry creds, so a
-# private image manifests as `ImagePullBackOff` → POLL_URLS sees the URLs but
-# 0 ready replicas → handleFailure fires → retry loop spawns N more deployments
-# all guaranteed to fail the same way. Making the package public is one PATCH
-# call and removes the entire failure mode for every current and future provider
-# without leaking creds into the SDL.
-#
-# IMAGE_TAG is always `ghcr.io/<namespace>/<package>:<tag>` (see
-# webhookEndpoint.ts → buildSpawner). We parse, then try the org endpoint
-# first (production case), falling back to the user endpoint for local /
-# self-hosted setups where the namespace is a personal account.
-#
-# Failure here is a WARNING, not fatal — the image is already pushed; the
-# only consequence is the deploy will hit the old failure mode. Operators
-# can re-run with a token that has the right scope.
-IMAGE_NO_TAG="${IMAGE_TAG%:*}"           # ghcr.io/<ns>/<pkg>
-NS_AND_PKG="${IMAGE_NO_TAG#ghcr.io/}"    # <ns>/<pkg>
-GHCR_NS="${NS_AND_PKG%%/*}"              # <ns>
-GHCR_PKG="${NS_AND_PKG#*/}"              # <pkg>
-
-echo "[builder] setting visibility=public on package ${GHCR_NS}/${GHCR_PKG}"
-ORG_CODE=$(curl -sS -o /tmp/vis.out -w "%{http_code}" -X PATCH \
-    -H "Authorization: Bearer $GHCR_TOKEN" \
-    -H "Accept: application/vnd.github+json" \
-    -H "X-GitHub-Api-Version: 2022-11-28" \
-    --max-time 15 \
-    "https://api.github.com/orgs/${GHCR_NS}/packages/container/${GHCR_PKG}/visibility" \
-    -d '{"visibility":"public"}' || echo "000")
-
-if [ "$ORG_CODE" = "204" ]; then
-    echo "[builder] package is now public (org)"
-elif [ "$ORG_CODE" = "404" ]; then
-    # Either the package isn't indexed by GitHub yet (race after first push) OR
-    # the namespace is a user, not an org. Try the user endpoint.
-    USER_CODE=$(curl -sS -o /tmp/vis.out -w "%{http_code}" -X PATCH \
-        -H "Authorization: Bearer $GHCR_TOKEN" \
-        -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" \
-        --max-time 15 \
-        "https://api.github.com/user/packages/container/${GHCR_PKG}/visibility" \
-        -d '{"visibility":"public"}' || echo "000")
-    if [ "$USER_CODE" = "204" ]; then
-        echo "[builder] package is now public (user)"
-    else
-        echo "[builder] WARNING: visibility PATCH failed (org=$ORG_CODE user=$USER_CODE) — providers may not be able to pull this image"
-        head -c 500 /tmp/vis.out 2>/dev/null || true
-        echo
-    fi
-else
-    echo "[builder] WARNING: visibility PATCH returned $ORG_CODE — providers may not be able to pull this image"
-    head -c 500 /tmp/vis.out 2>/dev/null || true
-    echo
+# Fields:
+#   phase          — "template" (render-dockerfile.sh path) or "nixpacks"
+#   framework      — detected framework label
+#   duration_ms    — total build+push time (excludes clone, excludes
+#                    dockerd boot). Apples-to-apples across builds.
+#   cache_root     — "/var/lib/af-cache" when a Fly Volume is mounted,
+#                    "ephemeral" otherwise. Ties a slow result directly
+#                    to missing persistence so we don't go hunting.
+#   cache_disk_gb  — available GB on the volume (or NaN if ephemeral);
+#                    early warning for full-volume cliffs.
+#   image_size_mb  — pushed manifest size (rough; we grab the first
+#                    layer's digest for a size estimate).
+CACHE_DISK_GB="null"
+CACHE_ROOT_LABEL="ephemeral"
+if [ -n "${AF_CACHE_ROOT:-}" ] && findmnt -T "$AF_CACHE_ROOT" >/dev/null 2>&1; then
+    CACHE_ROOT_LABEL="$AF_CACHE_ROOT"
+    CACHE_DISK_GB=$(df -BG --output=avail "$AF_CACHE_ROOT" 2>/dev/null | tail -n1 | tr -d 'G ' || echo null)
 fi
+
+if [ "$USE_TEMPLATE" = "1" ]; then
+    BUILD_PHASE="template"
+else
+    BUILD_PHASE="nixpacks"
+fi
+
+printf '[builder] telemetry: {"phase":"%s","framework":"%s","duration_ms":%d,"cache_root":"%s","cache_disk_gb":%s}\n' \
+    "$BUILD_PHASE" \
+    "$DETECTED_FRAMEWORK" \
+    "$BUILD_DURATION_MS" \
+    "$CACHE_ROOT_LABEL" \
+    "$CACHE_DISK_GB"
+
+# 5b. (Previously: PATCH GHCR visibility=public.)
+#
+# REMOVED: GitHub's REST API silently refuses to flip container package
+# visibility for team-plan orgs even with a correctly-scoped token and
+# admin role on both the org and the package — the endpoint returns 404
+# with no diagnostic info. Instead of fighting that, we now ship a
+# read-only GHCR pull token into the Akash SDL `credentials:` block (see
+# service-cloud-api/src/services/akash/orchestrator.ts:
+# buildGhcrCredentialsBlock). Providers use it as an imagePullSecret and
+# pull the private image natively — no GitHub visibility change needed.
+#
+# The image stays `private` at GHCR. That is intentional and fine.
+echo "[builder] package stays private — pull creds are injected into the Akash SDL by service-cloud-api"
 
 # 6. Success callback (with detected metadata).
 echo "[builder] success"

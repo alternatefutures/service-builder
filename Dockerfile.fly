@@ -30,7 +30,9 @@ FROM docker:24-dind
 RUN apk add --no-cache \
         bash \
         ca-certificates \
+        coreutils \
         curl \
+        findutils \
         git \
         gnupg \
         jq \
@@ -38,8 +40,17 @@ RUN apk add --no-cache \
         npm \
         openssh-client \
         tar \
+        util-linux \
         xz \
     && curl -fsSL https://nixpacks.com/install.sh | bash
+# coreutils: GNU `date +%s%3N` for millisecond timestamps in the
+#   per-build telemetry line (busybox date lacks %3N).
+# util-linux: GNU `findmnt` so build-fly.sh can distinguish "Fly Volume
+#   successfully mounted at AF_CACHE_ROOT" from "directory exists but
+#   mount silently failed" — the latter would write dockerd state onto
+#   the Firecracker rootfs and wedge the build on a full disk.
+# findutils: GNU `find -executable` used by the Rust template to
+#   locate the compiled binary.
 
 # NOTE — nixpacks-base pre-bake intentionally removed.
 # We previously `skopeo copy`d ghcr.io/railwayapp/nixpacks:ubuntu-* into
