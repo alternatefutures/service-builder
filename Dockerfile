@@ -1,33 +1,38 @@
 # af-builder — clones a connected git repo, runs Nixpacks to detect the
 # framework + build a container, and pushes the resulting image to GHCR.
-# The pod always pairs this container with a privileged `docker:24-dind`
-# sidecar; this image does not run docker itself, it just talks to the
-# sidecar via /var/run/docker.sock.
+# Kubernetes uses this image for clone, planning, and trusted publishing.
+# Only the publisher receives a socket to its private digest-pinned dind;
+# tenant Dockerfiles execute in a separate non-privileged rootless BuildKit.
 
-FROM node:20-bookworm-slim
+FROM docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS docker-cli
 
-# System deps. We pull docker-cli (talks to the dind sidecar) and the
-# Nixpacks single-binary installer.
+FROM node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0
+
+ARG NIXPACKS_VERSION=1.41.0
+ARG NIXPACKS_SHA256=194bcad8c379f78a309eee1a88b2e6b2abc59f354efe7ecd7b4bbaf21de99a06
+
+# System dependencies plus pinned Docker CLI/buildx binaries copied from the
+# official digest-pinned image. The trusted publisher talks to its private dind.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
         git \
-        gnupg \
         jq \
         openssh-client \
         xz-utils \
-    && install -m 0755 -d /etc/apt/keyrings \
-    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
-    && chmod a+r /etc/apt/keyrings/docker.gpg \
-    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" > /etc/apt/sources.list.d/docker.list \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
     && rm -rf /var/lib/apt/lists/* \
-    && curl -fsSL https://nixpacks.com/install.sh | bash
+    && curl --proto '=https' --tlsv1.2 -fsSL \
+        -o /tmp/nixpacks.tar.gz \
+        "https://github.com/railwayapp/nixpacks/releases/download/v${NIXPACKS_VERSION}/nixpacks-v${NIXPACKS_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "${NIXPACKS_SHA256}  /tmp/nixpacks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/nixpacks.tar.gz -C /usr/local/bin nixpacks \
+    && chmod 0755 /usr/local/bin/nixpacks \
+    && rm -f /tmp/nixpacks.tar.gz \
+    && nixpacks --version
 
-# Pin nixpacks via the install script's default for now; we can pin via
-# `NIXPACKS_VERSION=...` env in CI when we want determinism.
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
 
 WORKDIR /app
 COPY scripts/build.sh /app/build.sh
