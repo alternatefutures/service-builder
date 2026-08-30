@@ -1,8 +1,12 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
 # af-builder — clones a connected git repo, runs Nixpacks to detect the
 # framework + build a container, and pushes the resulting image to GHCR.
 # Kubernetes uses this image for clone, planning, and trusted publishing.
 # Only the publisher receives a socket to its private digest-pinned dind;
 # tenant Dockerfiles execute in a separate non-privileged rootless BuildKit.
+
+FROM curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 AS ca-certificates
 
 FROM docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS docker-cli
 
@@ -13,14 +17,27 @@ ARG NIXPACKS_SHA256=194bcad8c379f78a309eee1a88b2e6b2abc59f354efe7ecd7b4bbaf21de9
 
 # System dependencies plus pinned Docker CLI/buildx binaries copied from the
 # official digest-pinned image. The trusted publisher talks to its private dind.
-RUN apt-get update \
+COPY --from=ca-certificates --chown=0:0 --chmod=0644 \
+    /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN chmod 0755 /etc/ssl /etc/ssl/certs \
+    && sed -i \
+      -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: https://snapshot.debian.org/archive/debian-security/20260825T000000Z|' \
+      -e 's|^URIs: http://deb.debian.org/debian$|URIs: https://snapshot.debian.org/archive/debian/20260825T000000Z|' \
+      /etc/apt/sources.list.d/debian.sources \
+    && test "$(grep -Fxc 'URIs: https://snapshot.debian.org/archive/debian/20260825T000000Z' /etc/apt/sources.list.d/debian.sources)" = 1 \
+    && test "$(grep -Fxc 'URIs: https://snapshot.debian.org/archive/debian-security/20260825T000000Z' /etc/apt/sources.list.d/debian.sources)" = 1 \
+    && ! grep -Fq '20260825T000000Z-security' /etc/apt/sources.list.d/debian.sources \
+    && ! grep -Eq '^URIs: http://deb\.debian\.org/' /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/50snapshot \
+    && printf '%s\n' 'Acquire::https::CAInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/50ca-seed \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        curl \
-        git \
-        jq \
-        openssh-client \
-        xz-utils \
+        ca-certificates=20250419~deb12u1 \
+        curl=7.88.1-10+deb12u15 \
+        git=1:2.39.5-0+deb12u3 \
+        jq=1.6-2.1+deb12u2 \
+        openssh-client=1:9.2p1-2+deb12u10 \
+        xz-utils=5.4.1-1+deb12u1 \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -fsSL \
         -o /tmp/nixpacks.tar.gz \
