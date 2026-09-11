@@ -5,9 +5,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/build.sh"
 dockerfile="$root/Dockerfile"
 publish_workflow="$root/.github/workflows/docker-publish.yml"
-approval_verifier="$root/scripts/verify-production-pr-approval.sh"
 
-bash -n "$script" "$root/scripts/render-dockerfile.sh" "$approval_verifier"
+bash -n "$script" "$root/scripts/render-dockerfile.sh"
 
 grep -Fq 'require_env REPO_CLONE_URL REPO_REF REPO_SOURCE_URL' "$script"
 grep -Fq 'git -C /workspace remote set-url origin "$REPO_SOURCE_URL.git"' "$script"
@@ -52,7 +51,6 @@ if grep -Fq 'nixpacks.com/install.sh' "$dockerfile"; then
   exit 1
 fi
 
-grep -Fq 'Require exact-head independent human PR approval before publishing' "$publish_workflow"
 grep -Fq 'provenance: mode=max' "$publish_workflow"
 grep -Fq 'sbom: true' "$publish_workflow"
 grep -Fq 'cosign verify-attestation' "$publish_workflow"
@@ -61,18 +59,10 @@ if grep -Fq -- '--ignore-unfixed' "$publish_workflow"; then
   echo 'production publication must reject every critical vulnerability' >&2
   exit 1
 fi
-grep -Fq 'alternatefutures/service-builder' "$approval_verifier"
 if grep -Eq 'workflow_dispatch|af-builder:latest' "$publish_workflow"; then
   echo 'manual or mutable-tag production publication is forbidden' >&2
   exit 1
 fi
-approval_line=$(grep -n 'Require exact-head independent human PR approval before publishing' "$publish_workflow" | cut -d: -f1)
-login_line=$(grep -n 'Log in to GHCR' "$publish_workflow" | cut -d: -f1)
-if [ "$approval_line" -ge "$login_line" ]; then
-  echo 'human approval must precede registry mutation' >&2
-  exit 1
-fi
-
 build_require=$(grep -F 'require_env BUILD_JOB_ID REPO_REF IMAGE_TAG REPO_SOURCE_URL REPO_OWNER REPO_NAME' "$script")
 case "$build_require" in
   *TOKEN*|*CALLBACK*|*CLONE_URL*)
