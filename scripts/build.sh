@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# af-builder entrypoint — clones, runs nixpacks, pushes to GHCR, posts
-# status callbacks back to service-cloud-api.
+# af-builder phased entrypoint. Kubernetes runs this image in three isolated
+# containers: clone (repository credential only), plan (no credentials),
+# rootless BuildKit (no credentials), and publish (registry + callback
+# credentials only). No tenant-controlled build step ever shares a process
+# namespace, socket, or environment with a credential.
 #
 # Env contract (all required unless noted):
 #   BUILD_JOB_ID         — BuildJob.id we're updating
@@ -12,30 +15,28 @@
 #   GHCR_USER            — username for `docker login ghcr.io`
 #   GHCR_TOKEN           — PAT or App installation token with packages:write
 #   ROOT_DIRECTORY       — optional, monorepo subdir (defaults to ".")
-#   BUILD_COMMAND        — optional, nixpacks --build-cmd override
-#   START_COMMAND        — optional, nixpacks --start-cmd override
-#   DOCKER_HOST          — e.g. tcp://localhost:2375 (set by Job template; talks to dind sidecar)
+#   BUILD_COMMAND_B64    — optional base64-encoded build command override
+#   START_COMMAND_B64    — optional base64-encoded start command override
+#   DOCKER_HOST          — publisher-only socket for its isolated dind sidecar
 
 set -euo pipefail
 
-LOG_FILE=/tmp/build.log
-# Pre-create the log file BEFORE redirecting via process substitution.
-# `exec > >(tee -a "$LOG_FILE")` doesn't create the file until tee writes
-# its first byte, which is asynchronous — so any `tail -c "$LOG_FILE"` that
-# runs before tee flushes (e.g. the very first post_callback RUNNING) hits
-# ENOENT and, with `set -e` + the ERR trap, kills the whole build.
-: > "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2>&1
+PHASE="${AF_BUILD_PHASE:-build}"
+RESULT_DIR="${AF_BUILD_RESULT_DIR:-/results}"
+LOG_FILE="$RESULT_DIR/build.log"
+RESULT_FILE="$RESULT_DIR/result.json"
+IMAGE_ARCHIVE="$RESULT_DIR/image.tar"
+PLAN_FILE="$RESULT_DIR/plan.json"
+PLAN_READY="$RESULT_DIR/plan.ready"
 
-REQUIRED=(BUILD_JOB_ID CALLBACK_URL CALLBACK_TOKEN REPO_CLONE_URL REPO_REF IMAGE_TAG GHCR_USER GHCR_TOKEN REPO_SOURCE_URL REPO_OWNER REPO_NAME)
-for v in "${REQUIRED[@]}"; do
-    if [ -z "${!v:-}" ]; then
-        echo "[builder] missing required env: $v" >&2
-        exit 64
-    fi
-done
-
-ROOT_DIRECTORY="${ROOT_DIRECTORY:-.}"
+require_env() {
+    for v in "$@"; do
+        if [ -z "${!v:-}" ]; then
+            echo "[builder:$PHASE] missing required env: $v" >&2
+            exit 64
+        fi
+    done
+}
 
 post_callback() {
     local status="$1"
@@ -60,63 +61,102 @@ EOF
         -H "X-AF-Build-Token: $CALLBACK_TOKEN" \
         --max-time 30 \
         -d "$payload" >/dev/null \
-        || echo "[builder] WARNING: callback POST failed for status=$status (continuing)"
+        || echo "[builder:publish] WARNING: callback POST failed for status=$status (continuing)"
 }
 
-trap 'post_callback FAILED "\"errorMessage\": \"build script crashed (line $LINENO)\""; stop_log_streamer' ERR
+if [ "$PHASE" = "clone" ]; then
+    require_env REPO_CLONE_URL REPO_REF REPO_SOURCE_URL
+    echo "[builder:clone] fetching immutable source ref"
+    mkdir -p /workspace
+    git -C /workspace init -q
+    git -C /workspace remote add origin "$REPO_CLONE_URL"
+    git -C /workspace -c protocol.version=2 fetch --depth=1 origin "$REPO_REF"
+    git -C /workspace checkout -q FETCH_HEAD
+    # Never persist the authenticated URL into the shared workspace.
+    git -C /workspace remote set-url origin "$REPO_SOURCE_URL.git"
+    git -C /workspace config --unset-all http.extraheader 2>/dev/null || true
+    echo "[builder:clone] checked out $(git -C /workspace rev-parse HEAD)"
+    exit 0
+fi
 
-echo "[builder] starting build_job=$BUILD_JOB_ID  ref=$REPO_REF  image=$IMAGE_TAG"
-post_callback RUNNING
-
-# Background log streamer — re-POSTs the current tail of $LOG_FILE every
-# few seconds while the build runs so the UI's expandable logs viewer
-# fills in incrementally instead of staying empty until the terminal
-# callback. Status stays RUNNING; the buildCallbackEndpoint CAS gate
-# rejects any "downgrade" if a terminal callback wins the race, so this
-# is safe to leave running until just before the SUCCEEDED/FAILED post.
-LOG_STREAM_INTERVAL="${LOG_STREAM_INTERVAL:-5}"
-log_streamer() {
-    while sleep "$LOG_STREAM_INTERVAL"; do
-        post_callback RUNNING || true
+if [ "$PHASE" = "publish" ]; then
+    require_env BUILD_JOB_ID CALLBACK_URL CALLBACK_TOKEN IMAGE_TAG GHCR_USER GHCR_TOKEN
+    mkdir -p "$RESULT_DIR"
+    touch "$LOG_FILE"
+    echo "[builder:publish] waiting for docker daemon"
+    for i in {1..60}; do
+        docker version >/dev/null 2>&1 && break
+        [ "$i" = "60" ] && { post_callback FAILED '"errorMessage":"docker daemon unavailable"'; exit 65; }
+        sleep 1
     done
-}
-log_streamer &
-LOG_STREAMER_PID=$!
-stop_log_streamer() {
-    [ -n "${LOG_STREAMER_PID:-}" ] || return 0
-    kill "$LOG_STREAMER_PID" 2>/dev/null || true
-    wait "$LOG_STREAMER_PID" 2>/dev/null || true
-    LOG_STREAMER_PID=""
+    post_callback RUNNING
+    for i in {1..1800}; do
+        [ -s "$RESULT_FILE" ] && break
+        [ "$i" = "1800" ] && { post_callback FAILED '"errorMessage":"credential-free build phase timed out"'; exit 124; }
+        sleep 1
+    done
+    status=$(jq -r '.status' "$RESULT_FILE")
+    if [ "$status" != "SUCCEEDED" ]; then
+        error=$(jq -r '.errorMessage // "credential-free build phase failed"' "$RESULT_FILE" | jq -Rs .)
+        post_callback FAILED "\"errorMessage\":$error"
+        exit 1
+    fi
+    if [ ! -s "$IMAGE_ARCHIVE" ]; then
+        post_callback FAILED '"errorMessage":"credential-free build produced no image archive"'
+        exit 66
+    fi
+    if ! docker load --input "$IMAGE_ARCHIVE" >>"$LOG_FILE" 2>&1; then
+        post_callback FAILED '"errorMessage":"trusted publisher could not load the built image archive"'
+        exit 1
+    fi
+    echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+    if ! docker push "$IMAGE_TAG" >>"$LOG_FILE" 2>&1; then
+        post_callback FAILED '"errorMessage":"trusted registry publish failed"'
+        exit 1
+    fi
+    extra=$(jq -r '
+      {imageTag:env.IMAGE_TAG,commitSha:.commitSha,detectedFramework:.detectedFramework}
+      + (if .detectedPort == null then {} else {detectedPort:.detectedPort} end)
+      | to_entries | map("\"\(.key)\": \(.value | @json)") | join(",")
+    ' "$RESULT_FILE")
+    post_callback SUCCEEDED "$extra"
+    exit 0
+fi
+
+require_env BUILD_JOB_ID REPO_REF IMAGE_TAG REPO_SOURCE_URL REPO_OWNER REPO_NAME
+mkdir -p "$RESULT_DIR"
+: > "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+ROOT_DIRECTORY="${ROOT_DIRECTORY:-.}"
+
+decode_optional_command() {
+    local encoded="$1"
+    local legacy="$2"
+    if [ -z "$encoded" ]; then
+        printf '%s' "$legacy"
+        return
+    fi
+    if ! printf '%s' "$encoded" | base64 -d; then
+        echo "[builder:build] invalid base64 command override" >&2
+        return 64
+    fi
 }
 
-# 1. Wait for dind sidecar (or embedded dockerd on Fly) to come up.
-# DOCKER_HOST may be unset (Fly entrypoint clears it so docker defaults to
-# the local /var/run/docker.sock); use ${VAR:-default} so `set -u` doesn't
-# crash on the bare reference. The `docker version` probe below works
-# regardless of whether DOCKER_HOST is set or not.
-echo "[builder] waiting for docker daemon at ${DOCKER_HOST:-/var/run/docker.sock} …"
-for i in {1..60}; do
-    if docker version >/dev/null 2>&1; then
-        echo "[builder] docker is ready"
-        break
-    fi
-    if [ "$i" = "60" ]; then
-        echo "[builder] docker daemon never came up" >&2
-        exit 65
-    fi
-    sleep 1
-done
+BUILD_COMMAND="$(decode_optional_command "${BUILD_COMMAND_B64:-}" "${BUILD_COMMAND:-}")"
+START_COMMAND="$(decode_optional_command "${START_COMMAND_B64:-}" "${START_COMMAND:-}")"
 
-# 2. Clone.
-echo "[builder] cloning…"
-mkdir -p /workspace
-git -C /workspace init -q
-git -C /workspace remote add origin "$REPO_CLONE_URL"
-git -C /workspace -c protocol.version=2 fetch --depth=1 origin "$REPO_REF"
-git -C /workspace checkout -q FETCH_HEAD
+write_failure() {
+    local line="${1:-unknown}"
+    jq -n --arg error "credential-free build phase crashed (line $line)" \
+      '{status:"FAILED",errorMessage:$error}' >"$RESULT_FILE.tmp"
+    mv "$RESULT_FILE.tmp" "$RESULT_FILE"
+}
+trap 'write_failure "$LINENO"' ERR
+
+echo "[builder:$PHASE] starting build_job=$BUILD_JOB_ID ref=$REPO_REF image=$IMAGE_TAG"
 
 ACTUAL_SHA=$(git -C /workspace rev-parse HEAD)
-echo "[builder] checked out $ACTUAL_SHA"
+echo "[builder:build] using checked-out source $ACTUAL_SHA"
 
 # 3. Framework detection — primary source: the manifest the user wrote.
 #
@@ -188,6 +228,7 @@ elif [ -f "$SRC_DIR/pom.xml" ] || [ -f "$SRC_DIR/build.gradle" ] || [ -f "$SRC_D
 elif [ -f "$SRC_DIR/deno.json" ] || [ -f "$SRC_DIR/deno.jsonc" ]; then DETECTED_FRAMEWORK="deno"
 elif [ -f "$SRC_DIR/Dockerfile" ];                                     then DETECTED_FRAMEWORK="docker"
 fi
+
 echo "[builder] manifest-based detection: framework=$DETECTED_FRAMEWORK"
 
 # Optional enrichment — ask nixpacks for the port hint, but NEVER let it
@@ -246,18 +287,25 @@ fi
 # Escape hatches in either path:
 #   - $BUILD_COMMAND / $START_COMMAND env vars override the defaults
 #   - A committed $SRC_DIR/Dockerfile is picked up by framework=docker
-#     (the template for that just re-emits `FROM $IMAGE` style — not
-#     yet implemented; today `docker` falls through to nixpacks which
-#     handles it gracefully)
+#     (committed Dockerfiles deliberately fall through to nixpacks, which
+#     builds them without rewriting user intent)
 USE_TEMPLATE=1
 TEMPLATE_PATH="$SRC_DIR/.af/Dockerfile"
 mkdir -p "$SRC_DIR/.af"
-if SRC_DIR="$SRC_DIR" BUILD_COMMAND="${BUILD_COMMAND:-}" START_COMMAND="${START_COMMAND:-}" \
+if [ -f "$SRC_DIR/Dockerfile" ]; then
+    USE_TEMPLATE=0
+    cp "$SRC_DIR/Dockerfile" "$TEMPLATE_PATH.tmp"
+    mv "$TEMPLATE_PATH.tmp" "$TEMPLATE_PATH"
+    echo "[builder] using repository Dockerfile"
+    DOCKERFILE_PATH="$TEMPLATE_PATH"
+elif SRC_DIR="$SRC_DIR" BUILD_COMMAND="${BUILD_COMMAND:-}" START_COMMAND="${START_COMMAND:-}" \
         DETECTED_PORT="${DETECTED_PORT:-}" \
-        /app/render-dockerfile.sh "$DETECTED_FRAMEWORK" >"$TEMPLATE_PATH" 2>>"$LOG_FILE"; then
+        /app/render-dockerfile.sh "$DETECTED_FRAMEWORK" >"$TEMPLATE_PATH.tmp" 2>>"$LOG_FILE"; then
+    mv "$TEMPLATE_PATH.tmp" "$TEMPLATE_PATH"
     echo "[builder] using template Dockerfile (framework=$DETECTED_FRAMEWORK)"
     DOCKERFILE_PATH="$TEMPLATE_PATH"
 else
+    rm -f "$TEMPLATE_PATH.tmp"
     USE_TEMPLATE=0
     echo "[builder] no template for framework=$DETECTED_FRAMEWORK — falling back to nixpacks"
     NIXPACKS_ARGS=("build" "$SRC_DIR" "--name" "$IMAGE_TAG" "--platform" "linux/amd64" "--out" "$SRC_DIR")
@@ -271,52 +319,50 @@ else
         echo "[builder] ERROR: nixpacks produced no Dockerfile at $SRC_DIR/.nixpacks/Dockerfile" >&2
         exit 66
     fi
-    DOCKERFILE_PATH="$SRC_DIR/.nixpacks/Dockerfile"
+    cp "$SRC_DIR/.nixpacks/Dockerfile" "$TEMPLATE_PATH.tmp"
+    mv "$TEMPLATE_PATH.tmp" "$TEMPLATE_PATH"
+    DOCKERFILE_PATH="$TEMPLATE_PATH"
 fi
 
-# Log in to GHCR up front so both the cache import and the image push
-# below can talk to `ghcr.io/<namespace>/*` without extra auth steps.
-echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
+# The Kubernetes planner stops here. It never executes the generated
+# Dockerfile and never receives a container-runtime socket. Rootless BuildKit
+# consumes the immutable workspace and this ready marker in a separate,
+# credential-free container.
+jq -n \
+    --arg sha "$ACTUAL_SHA" \
+    --arg fw "$DETECTED_FRAMEWORK" \
+    --arg port "${DETECTED_PORT:-}" \
+    '{status:"SUCCEEDED",commitSha:$sha,detectedFramework:$fw} +
+     (if $port == "" then {} else {detectedPort: ($port|tonumber? // null)} end)' \
+    >"$PLAN_FILE.tmp"
+mv "$PLAN_FILE.tmp" "$PLAN_FILE"
+if [ "$PHASE" = "plan" ]; then
+    : >"$PLAN_READY.tmp"
+    mv "$PLAN_READY.tmp" "$PLAN_READY"
+    trap - ERR
+    echo "[builder:plan] build plan ready for rootless BuildKit"
+    exit 0
+fi
 
-# ---------------------------------------------------------------------------
-# Build driver choice + cache strategy (Phase 2: registry cache-to)
-# ---------------------------------------------------------------------------
-# We use a `docker-container` buildx driver with a deterministic builder
-# name (`af-buildkit`) so we can push a full registry cache on every
-# build (`type=registry,mode=max`). The default `docker` driver doesn't
-# support `mode=max` cache-to — only `type=inline`, which collapses
-# multi-stage builders (Go, Rust, Nixpacks) into a single cached stage
-# and silently under-caches those builds.
-#
-# Why this still persists across machine reaps:
-#   - `docker buildx create --driver docker-container` spawns a sibling
-#     container named `buildx_buildkit_<builder>0`. That container's
-#     metadata + overlay2 layer live under dockerd's data-root.
-#   - build-fly.sh points `dockerd --data-root` at the mounted Fly
-#     Volume, so the buildkit sibling container + its snapshotter
-#     state + its `--mount=type=cache` dirs are all on the volume.
-#   - When a new machine attaches the same volume, `docker buildx
-#     inspect af-buildkit` finds the existing container and reuses it
-#     verbatim. Same warm pnpm store, same Python wheels, same
-#     node_modules layers.
-#
-# Cross-machine warmup for brand-new volumes (or a freshly-reaped
-# machine where the buildkit container got GC'd):
-#   - `--cache-to type=registry,ref=$CACHE_REF,mode=max` pushes every
-#     intermediate stage's cache to `ghcr.io/.../:buildcache`.
-#   - `--cache-from type=registry,ref=$CACHE_REF` pulls it back on
-#     first-ever builds. Even a completely cold volume warms up on
-#     the first build after priming.
-#
-# Net behavior:
-#   - First-ever build on empty volume (pre-prime): ~3-4 min (base
-#     image pull + dep install).
-#   - First-ever build on primed volume: ~60-90s (skips apt + base
-#     pulls because prime-cache.sh wrote them to the volume).
-#   - Second build of same service, same deps, SAME machine: ~15-30s.
-#   - First build after a machine reap / zone migration: ~60-90s
-#     (hydrates from :buildcache even if the volume was lost).
-CACHE_REF="${IMAGE_TAG%:*}:buildcache"
+# Legacy/local build phase only. Kubernetes production uses the separate
+# rootless BuildKit container and therefore never exposes this phase to dind.
+echo "[builder] waiting for docker daemon at ${DOCKER_HOST:-/var/run/docker.sock} …"
+for i in {1..60}; do
+    if docker version >/dev/null 2>&1; then
+        echo "[builder] docker is ready"
+        break
+    fi
+    if [ "$i" = "60" ]; then
+        echo "[builder] docker daemon never came up" >&2
+        exit 65
+    fi
+    sleep 1
+done
+
+# Legacy/local build driver. Production Kubernetes stops in `plan` and uses
+# the pinned rootless BuildKit container rendered by service-cloud-api. This
+# path remains runnable for developer smoke tests without affecting the
+# production credential boundary.
 BUILDX_BUILDER="${BUILDX_BUILDER:-af-buildkit}"
 
 # Idempotent builder creation. `inspect` returns non-zero when the
@@ -335,29 +381,10 @@ else
     echo "[builder] reusing existing buildx builder: $BUILDX_BUILDER"
 fi
 
-# BuildKit inside the sibling container needs DNS for registry pulls
-# during `--cache-from`. We already pass --dns to dockerd in
-# build-fly.sh, but the buildx container inherits its own resolv.conf
-# at create time — on older buildx this can be empty. Print the current
-# builder config to the log so DNS misconfigs show up immediately
-# instead of manifesting as "no cache available".
+# Print the local builder configuration so daemon/driver failures are visible.
 docker buildx inspect "$BUILDX_BUILDER" --bootstrap | sed 's/^/[builder] buildx: /' || true
 
-echo "[builder] running: docker buildx build (cache-from+to=$CACHE_REF, driver=docker-container, volume=${AF_CACHE_ROOT:-<ephemeral>})"
-# `--push` publishes the image in the same step (the docker-container
-# driver doesn't populate dockerd's local image store, so we must
-# --push or --load explicitly; --push is what we want anyway).
-#
-# --cache-to mode=max: exports ALL intermediate stages' caches to the
-# registry, not just the final stage. Essential for multi-stage Rust/Go
-# templates and for the Nixpacks fallback (nixpacks Dockerfiles tend to
-# stack 5-10 deps/build/prod stages and only the final stage would
-# round-trip on `mode=min`).
-#
-# ignore-error=true on cache-to: if the registry is temporarily
-# unreachable or GHCR returns 5xx on the PUT, don't fail the build
-# itself. Cache-to is an optimization, not a correctness requirement.
-#
+echo "[builder] running credential-free docker buildx build --load"
 # --label org.opencontainers.image.source: stamped so GHCR auto-links
 # this container package to the source GitHub repo on push. Label
 # value is the clean https URL (no auth token), safe to embed.
@@ -374,9 +401,7 @@ docker buildx build \
     --label "org.opencontainers.image.source=$REPO_SOURCE_URL" \
     --label "org.opencontainers.image.revision=$REPO_REF" \
     --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --cache-from "type=registry,ref=$CACHE_REF" \
-    --cache-to "type=registry,ref=$CACHE_REF,mode=max,ignore-error=true" \
-    --push \
+    --load \
     "$SRC_DIR"
 BUILD_END_MS=$(date +%s%3N)
 BUILD_DURATION_MS=$((BUILD_END_MS - BUILD_START_MS))
@@ -421,37 +446,15 @@ printf '[builder] telemetry: {"phase":"%s","framework":"%s","duration_ms":%d,"ca
     "$CACHE_ROOT_LABEL" \
     "$CACHE_DISK_GB"
 
-# 5b. (Previously: PATCH GHCR visibility=public.)
-#
-# REMOVED: GitHub's REST API silently refuses to flip container package
-# visibility for team-plan orgs even with a correctly-scoped token and
-# admin role on both the org and the package — the endpoint returns 404
-# with no diagnostic info. Instead of fighting that, we now ship a
-# read-only GHCR pull token into the Akash SDL `credentials:` block (see
-# service-cloud-api/src/services/akash/orchestrator.ts:
-# buildGhcrCredentialsBlock). Providers use it as an imagePullSecret and
-# pull the private image natively — no GitHub visibility change needed.
-#
-# The image stays `private` at GHCR. That is intentional and fine.
-echo "[builder] package stays private — pull creds are injected into the Akash SDL by service-cloud-api"
-
-# 6. Success callback (with detected metadata).
-echo "[builder] success"
-# `-r` (raw output) is REQUIRED here. The jq expression evaluates to a STRING
-# of pre-formatted JSON key/value pairs that we splice into the heredoc with
-# a leading comma. With the default `-c` (compact JSON), jq would re-encode
-# that string with surrounding quotes and escaped inner quotes, producing
-# `,"\"imageTag\": ..."` — a JSON syntax error the API rejects with HTTP 400.
-EXTRA=$(jq -nr \
-    --arg image "$IMAGE_TAG" \
+echo "[builder:build] success; handing image to isolated publisher"
+docker save --output "$IMAGE_ARCHIVE.tmp" "$IMAGE_TAG"
+mv "$IMAGE_ARCHIVE.tmp" "$IMAGE_ARCHIVE"
+jq -n \
     --arg sha "$ACTUAL_SHA" \
     --arg fw "$DETECTED_FRAMEWORK" \
     --arg port "${DETECTED_PORT:-}" \
-    '{imageTag:$image, commitSha:$sha, detectedFramework:$fw} + (if $port == "" then {} else {detectedPort: ($port|tonumber? // null)} end) | to_entries | map("\"\(.key)\": \(.value | @json)") | join(",")')
-# Stop the streamer BEFORE the terminal callback so a late RUNNING tick
-# never races a SUCCEEDED. The CAS gate would reject a downgrade anyway,
-# but draining cleanly avoids a 200-with-ignored noise log on the API.
-stop_log_streamer
-post_callback SUCCEEDED "$EXTRA"
-
+    '{status:"SUCCEEDED",commitSha:$sha,detectedFramework:$fw}
+     + (if $port == "" then {} else {detectedPort: ($port|tonumber? // null)} end)' \
+    >"$RESULT_FILE.tmp"
+mv "$RESULT_FILE.tmp" "$RESULT_FILE"
 trap - ERR

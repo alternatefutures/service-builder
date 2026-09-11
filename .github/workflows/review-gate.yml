@@ -1,0 +1,66 @@
+name: Human Review Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  review-gate:
+    name: Human approval on current head
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a current non-author human approval
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) { core.setFailed('No pull_request payload.'); return; }
+            const AGENT_PERSONAS = new Set([
+              'quinn-altfutures',
+              'senku-altfutures',
+              'lain-altfutures',
+            ]);
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            const latestByUser = new Map();
+            const decisionStates = new Set(['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED']);
+            for (const review of reviews) {
+              if (
+                !review.user ||
+                review.user.type === 'Bot' ||
+                review.user.login === pr.user.login ||
+                AGENT_PERSONAS.has(review.user.login) ||
+                review.commit_id !== pr.head.sha ||
+                !decisionStates.has(review.state)
+              ) continue;
+              const previous = latestByUser.get(review.user.login);
+              if (!previous || review.id > previous.id) {
+                latestByUser.set(review.user.login, review);
+              }
+            }
+
+            const approvals = [...latestByUser.values()]
+              .filter(review => review.state === 'APPROVED');
+            await core.summary
+              .addHeading('Human Review Gate')
+              .addRaw(`Head commit: \`${pr.head.sha}\`\n\n`)
+              .addRaw(approvals.length > 0
+                ? `Approved by ${approvals.map(review => `@${review.user.login}`).join(', ')}.`
+                : 'Blocked: this head requires approval from at least one non-author human reviewer.')
+              .write();
+
+            if (approvals.length === 0) {
+              core.setFailed('Current head has no non-author human approval.');
+            }
