@@ -42,7 +42,7 @@ fi
 grep -Eq '^ARG NIXPACKS_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$dockerfile"
 grep -Eq '^ARG NIXPACKS_SHA256=[a-f0-9]{64}$' "$dockerfile"
 grep -Fq 'sha256sum -c -' "$dockerfile"
-grep -Eq '^FROM docker:29\.1\.4-dind@sha256:[a-f0-9]{64} AS docker-engine$' "$fly_dockerfile"
+grep -Eq '^FROM docker:29\.8\.2-dind@sha256:[a-f0-9]{64} AS docker-engine$' "$fly_dockerfile"
 grep -Eq '^FROM node:22-trixie-slim@sha256:[a-f0-9]{64}$' "$fly_dockerfile"
 grep -Fq 'ENTRYPOINT ["/app/build-fly.sh"]' "$fly_dockerfile"
 grep -Fq 'AF_BUILD_PHASE=clone' "$fly_phases"
