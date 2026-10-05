@@ -271,7 +271,7 @@ fi
 # 4. Produce the Dockerfile for this build.
 #
 # Path A (fast, default): render-dockerfile.sh emits a template tuned
-# for the detected framework — official runtime images (node:20-slim,
+# for the detected framework — official runtime images (node:22-bookworm-slim,
 # python:3.12-slim, golang:1.23-alpine, …), buildkit cache mounts for
 # the package manager dep cache, and single- or multi-stage builds
 # appropriate to the language. Cold builds finish in 60-120s instead
