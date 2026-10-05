@@ -20,19 +20,22 @@ grep -Fq 'if [ "$PHASE" = "plan" ]' "$script"
 grep -Fq 'build plan ready for rootless BuildKit' "$script"
 grep -Fq 'cp "$SRC_DIR/Dockerfile" "$TEMPLATE_PATH.tmp"' "$script"
 grep -Fq 'cp "$SRC_DIR/.nixpacks/Dockerfile" "$TEMPLATE_PATH.tmp"' "$script"
-grep -Eq '^FROM node:22-bookworm-slim@sha256:[a-f0-9]{64}$' "$dockerfile"
-grep -Eq '^FROM docker:27\.5\.1-cli@sha256:[a-f0-9]{64} AS docker-cli$' "$dockerfile"
+grep -Eq '^FROM node:22-trixie-slim@sha256:[a-f0-9]{64}$' "$dockerfile"
+grep -Eq '^FROM docker:29\.8\.2-cli@sha256:[a-f0-9]{64} AS docker-cli$' "$dockerfile"
 grep -Eq '^# syntax=docker/dockerfile:1\.7@sha256:[a-f0-9]{64}$' "$dockerfile"
 grep -Eq '^FROM curlimages/curl:[^@]+@sha256:[a-f0-9]{64} AS ca-certificates$' "$dockerfile"
-test "$(grep -Fc 'archive/debian/20260825T000000Z' "$dockerfile")" = 2
-test "$(grep -Fc 'archive/debian-security/20260825T000000Z' "$dockerfile")" = 2
-grep -Fq "! grep -Fq '20260825T000000Z-security'" "$dockerfile"
-grep -Fq 'ca-certificates=20250419~deb12u1' "$dockerfile"
-grep -Fq 'curl=7.88.1-10+deb12u15' "$dockerfile"
-grep -Fq 'git=1:2.39.5-0+deb12u3' "$dockerfile"
-grep -Fq 'jq=1.6-2.1+deb12u2' "$dockerfile"
-grep -Fq 'openssh-client=1:9.2p1-2+deb12u10' "$dockerfile"
-grep -Fq 'xz-utils=5.4.1-1+deb12u1' "$dockerfile"
+test "$(grep -Fc 'archive/debian/20260918T000000Z' "$dockerfile")" = 2
+test "$(grep -Fc 'archive/debian-security/20260918T000000Z' "$dockerfile")" = 2
+grep -Fq "! grep -Fq '20260918T000000Z-security'" "$dockerfile"
+grep -Fq 'ca-certificates=20250419' "$dockerfile"
+grep -Fq 'curl=8.14.1-2+deb13u5' "$dockerfile"
+grep -Fq 'git=1:2.47.3-0+deb13u1' "$dockerfile"
+grep -Fq 'jq=1.7.1-6+deb13u3' "$dockerfile"
+grep -Fq 'xz-utils=5.8.1-1+deb13u1' "$dockerfile"
+if grep -Fq 'openssh-client=' "$dockerfile"; then
+  echo 'HTTPS-only builder must not include an SSH client' >&2
+  exit 1
+fi
 grep -Eq '^ARG NIXPACKS_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$dockerfile"
 grep -Eq '^ARG NIXPACKS_SHA256=[a-f0-9]{64}$' "$dockerfile"
 grep -Fq 'sha256sum -c -' "$dockerfile"

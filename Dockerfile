@@ -8,9 +8,9 @@
 
 FROM curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 AS ca-certificates
 
-FROM docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c AS docker-cli
+FROM docker:29.8.2-cli@sha256:b1805116a6a86cc591b5d5f60a910a0715cdcc9d18d866ad68b1457ead25c35c AS docker-cli
 
-FROM node:22-bookworm-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c
+FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4
 
 ARG NIXPACKS_VERSION=1.41.0
 ARG NIXPACKS_SHA256=194bcad8c379f78a309eee1a88b2e6b2abc59f354efe7ecd7b4bbaf21de99a06
@@ -21,23 +21,22 @@ COPY --from=ca-certificates --chown=0:0 --chmod=0644 \
     /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 RUN chmod 0755 /etc/ssl /etc/ssl/certs \
     && sed -i \
-      -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: https://snapshot.debian.org/archive/debian-security/20260825T000000Z|' \
-      -e 's|^URIs: http://deb.debian.org/debian$|URIs: https://snapshot.debian.org/archive/debian/20260825T000000Z|' \
+      -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: https://snapshot.debian.org/archive/debian-security/20260918T000000Z|' \
+      -e 's|^URIs: http://deb.debian.org/debian$|URIs: https://snapshot.debian.org/archive/debian/20260918T000000Z|' \
       /etc/apt/sources.list.d/debian.sources \
-    && test "$(grep -Fxc 'URIs: https://snapshot.debian.org/archive/debian/20260825T000000Z' /etc/apt/sources.list.d/debian.sources)" = 1 \
-    && test "$(grep -Fxc 'URIs: https://snapshot.debian.org/archive/debian-security/20260825T000000Z' /etc/apt/sources.list.d/debian.sources)" = 1 \
-    && ! grep -Fq '20260825T000000Z-security' /etc/apt/sources.list.d/debian.sources \
+    && test "$(grep -Fxc 'URIs: https://snapshot.debian.org/archive/debian/20260918T000000Z' /etc/apt/sources.list.d/debian.sources)" = 1 \
+    && test "$(grep -Fxc 'URIs: https://snapshot.debian.org/archive/debian-security/20260918T000000Z' /etc/apt/sources.list.d/debian.sources)" = 1 \
+    && ! grep -Fq '20260918T000000Z-security' /etc/apt/sources.list.d/debian.sources \
     && ! grep -Eq '^URIs: http://deb\.debian\.org/' /etc/apt/sources.list.d/debian.sources \
     && printf '%s\n' 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/50snapshot \
     && printf '%s\n' 'Acquire::https::CAInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/50ca-seed \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        ca-certificates=20250419~deb12u1 \
-        curl=7.88.1-10+deb12u15 \
-        git=1:2.39.5-0+deb12u3 \
-        jq=1.6-2.1+deb12u2 \
-        openssh-client=1:9.2p1-2+deb12u10 \
-        xz-utils=5.4.1-1+deb12u1 \
+        ca-certificates=20250419 \
+        curl=8.14.1-2+deb13u5 \
+        git=1:2.47.3-0+deb13u1 \
+        jq=1.7.1-6+deb13u3 \
+        xz-utils=5.8.1-1+deb13u1 \
     && rm -rf /var/lib/apt/lists/* \
     && curl --proto '=https' --tlsv1.2 -fsSL \
         -o /tmp/nixpacks.tar.gz \
