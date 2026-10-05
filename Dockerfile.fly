@@ -1,0 +1,68 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+
+# Dedicated single-machine executor for Alternate Clouds' Fly build backend.
+# This is platform tooling only; customer source and built application images
+# remain private. Docker's engine binaries are copied from the immutable
+# official dind image into the same pinned Debian/Node base as the phased
+# builder, so Nixpacks runs against glibc rather than an Alpine compatibility
+# shim.
+FROM curlimages/curl:8.16.0@sha256:463eaf6072688fe96ac64fa623fe73e1dbe25d8ad6c34404a669ad3ce1f104b6 AS ca-certificates
+
+FROM docker:29.1.4-dind@sha256:d95427251fd155cd69a03311a8c4edf6d0778595444afc2d2c800a156eb2ecac AS docker-engine
+
+FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a401094b906d27b29338d4
+
+ARG NIXPACKS_VERSION=1.41.0
+ARG NIXPACKS_SHA256=194bcad8c379f78a309eee1a88b2e6b2abc59f354efe7ecd7b4bbaf21de99a06
+
+COPY --from=ca-certificates --chown=0:0 --chmod=0644 \
+    /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+RUN chmod 0755 /etc/ssl /etc/ssl/certs \
+    && sed -i \
+      -e 's|^URIs: http://deb.debian.org/debian-security$|URIs: https://snapshot.debian.org/archive/debian-security/20260918T000000Z|' \
+      -e 's|^URIs: http://deb.debian.org/debian$|URIs: https://snapshot.debian.org/archive/debian/20260918T000000Z|' \
+      /etc/apt/sources.list.d/debian.sources \
+    && printf '%s\n' 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/50snapshot \
+    && printf '%s\n' 'Acquire::https::CAInfo "/etc/ssl/certs/ca-certificates.crt";' > /etc/apt/apt.conf.d/50ca-seed \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates=20250419 \
+        curl=8.14.1-2+deb13u5 \
+        git=1:2.47.3-0+deb13u1 \
+        iptables \
+        jq=1.7.1-6+deb13u3 \
+        pigz \
+        xz-utils=5.8.1-1+deb13u1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl --proto '=https' --tlsv1.2 -fsSL \
+        -o /tmp/nixpacks.tar.gz \
+        "https://github.com/railwayapp/nixpacks/releases/download/v${NIXPACKS_VERSION}/nixpacks-v${NIXPACKS_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "${NIXPACKS_SHA256}  /tmp/nixpacks.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/nixpacks.tar.gz -C /usr/local/bin nixpacks \
+    && chmod 0755 /usr/local/bin/nixpacks \
+    && rm -f /tmp/nixpacks.tar.gz \
+    && nixpacks --version
+
+COPY --from=docker-engine /usr/local/bin/containerd /usr/local/bin/containerd
+COPY --from=docker-engine /usr/local/bin/containerd-shim-runc-v2 /usr/local/bin/containerd-shim-runc-v2
+COPY --from=docker-engine /usr/local/bin/ctr /usr/local/bin/ctr
+COPY --from=docker-engine /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker-engine /usr/local/bin/docker-init /usr/local/bin/docker-init
+COPY --from=docker-engine /usr/local/bin/docker-proxy /usr/local/bin/docker-proxy
+COPY --from=docker-engine /usr/local/bin/dockerd /usr/local/bin/dockerd
+COPY --from=docker-engine /usr/local/bin/runc /usr/local/bin/runc
+COPY --from=docker-engine /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx
+
+WORKDIR /app
+COPY scripts/build.sh /app/build.sh
+COPY scripts/build-fly.sh /app/build-fly.sh
+COPY scripts/build-fly-phases.sh /app/build-fly-phases.sh
+COPY scripts/render-dockerfile.sh /app/render-dockerfile.sh
+RUN chmod 0555 \
+    /app/build.sh \
+    /app/build-fly.sh \
+    /app/build-fly-phases.sh \
+    /app/render-dockerfile.sh
+
+ENV DOCKER_DEFAULT_PLATFORM=linux/amd64
+ENTRYPOINT ["/app/build-fly.sh"]

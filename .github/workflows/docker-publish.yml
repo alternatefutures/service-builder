@@ -61,19 +61,41 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build and publish immutable Fly executor candidate
+        id: fly_build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.fly
+          platforms: linux/amd64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}-fly
+          cache-from: type=gha,scope=fly
+          cache-to: type=gha,mode=max,scope=fly
+
       - name: Resolve immutable image reference
         id: image
         env:
           BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+          FLY_BUILD_DIGEST: ${{ steps.fly_build.outputs.digest }}
         run: |
           set -euo pipefail
           if [[ ! "${BUILD_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo 'build did not emit a valid digest' >&2
             exit 1
           fi
+          if [[ ! "${FLY_BUILD_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo 'Fly executor build did not emit a valid digest' >&2
+            exit 1
+          fi
           image_ref="${IMAGE}@${BUILD_DIGEST}"
+          fly_image_ref="${IMAGE}@${FLY_BUILD_DIGEST}"
           echo "ref=${image_ref}" >> "${GITHUB_OUTPUT}"
+          echo "fly_ref=${fly_image_ref}" >> "${GITHUB_OUTPUT}"
           echo "BUILDER_IMAGE=${image_ref}" >> "${GITHUB_STEP_SUMMARY}"
+          echo "FLY_BUILDER_IMAGE=${fly_image_ref}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Install pinned cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v3
@@ -106,17 +128,31 @@ jobs:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: syft "${IMAGE_REF}" -o cyclonedx-json=sbom.cyclonedx.json
 
+      - name: Generate exact Fly-executor SBOM
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.fly_ref }}
+        run: syft "${IMAGE_REF}" -o cyclonedx-json=sbom-fly.cyclonedx.json
+
       - name: Upload SBOM artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: af-builder-sbom-${{ github.sha }}
-          path: sbom.cyclonedx.json
+          path: |
+            sbom.cyclonedx.json
+            sbom-fly.cyclonedx.json
           retention-days: 90
           if-no-files-found: error
 
       - name: Reject critical vulnerabilities
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          trivy image --timeout 15m --scanners vuln --severity CRITICAL \
+            --exit-code 1 --format table "${IMAGE_REF}"
+
+      - name: Reject critical Fly-executor vulnerabilities
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.fly_ref }}
         run: |
           trivy image --timeout 15m --scanners vuln --severity CRITICAL \
             --exit-code 1 --format table "${IMAGE_REF}"
@@ -131,9 +167,32 @@ jobs:
           cosign attest --yes --predicate sbom.cyclonedx.json \
             --type cyclonedx "${IMAGE_REF}"
 
+      - name: Sign and attest verified Fly executor image
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.fly_ref }}
+          COSIGN_EXPERIMENTAL: 'true'
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${IMAGE_REF}"
+          cosign attest --yes --predicate sbom-fly.cyclonedx.json \
+            --type cyclonedx "${IMAGE_REF}"
+
       - name: Verify exact signing identity and SBOM attestation
         env:
           IMAGE_REF: ${{ steps.image.outputs.ref }}
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/docker-publish.yml@refs/heads/main
+          CERTIFICATE_ISSUER: https://token.actions.githubusercontent.com
+        run: |
+          set -euo pipefail
+          cosign verify --certificate-identity "${CERTIFICATE_IDENTITY}" \
+            --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE_REF}" >/dev/null
+          cosign verify-attestation --type cyclonedx \
+            --certificate-identity "${CERTIFICATE_IDENTITY}" \
+            --certificate-oidc-issuer "${CERTIFICATE_ISSUER}" "${IMAGE_REF}" >/dev/null
+
+      - name: Verify exact Fly-executor signing identity and SBOM attestation
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.fly_ref }}
           CERTIFICATE_IDENTITY: https://github.com/${{ github.repository }}/.github/workflows/docker-publish.yml@refs/heads/main
           CERTIFICATE_ISSUER: https://token.actions.githubusercontent.com
         run: |
