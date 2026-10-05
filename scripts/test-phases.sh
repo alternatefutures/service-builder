@@ -52,6 +52,7 @@ grep -Fq -- '-u GHCR_TOKEN' "$fly_phases"
 grep -Fq -- '-u CALLBACK_TOKEN' "$fly_phases"
 grep -Fq -- '-u REPO_CLONE_URL' "$fly_phases"
 grep -Fq 'AF_BUILD_TIMEOUT_SECONDS' "$fly_entrypoint"
+grep -Fq 'export BUILDX_BUILDER=default' "$fly_entrypoint"
 if grep -E '^[[:space:]]*FROM [^[:space:]]+(:[^@[:space:]]+)?([[:space:]]+AS[[:space:]]|$)' \
     "$root/scripts/render-dockerfile.sh" "$dockerfile" | grep -Ev '@sha256:[a-f0-9]{64}([[:space:]]+AS[[:space:]]|$)'; then
   echo 'mutable generated Dockerfile base image is forbidden' >&2
