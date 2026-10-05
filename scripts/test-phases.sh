@@ -4,9 +4,12 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 script="$root/scripts/build.sh"
 dockerfile="$root/Dockerfile"
+fly_dockerfile="$root/Dockerfile.fly"
+fly_entrypoint="$root/scripts/build-fly.sh"
+fly_phases="$root/scripts/build-fly-phases.sh"
 publish_workflow="$root/.github/workflows/docker-publish.yml"
 
-bash -n "$script" "$root/scripts/render-dockerfile.sh"
+bash -n "$script" "$root/scripts/render-dockerfile.sh" "$fly_entrypoint" "$fly_phases"
 
 grep -Fq 'require_env REPO_CLONE_URL REPO_REF REPO_SOURCE_URL' "$script"
 grep -Fq 'git -C /workspace remote set-url origin "$REPO_SOURCE_URL.git"' "$script"
@@ -39,6 +42,16 @@ fi
 grep -Eq '^ARG NIXPACKS_VERSION=[0-9]+\.[0-9]+\.[0-9]+$' "$dockerfile"
 grep -Eq '^ARG NIXPACKS_SHA256=[a-f0-9]{64}$' "$dockerfile"
 grep -Fq 'sha256sum -c -' "$dockerfile"
+grep -Eq '^FROM docker:29\.1\.4-dind@sha256:[a-f0-9]{64} AS docker-engine$' "$fly_dockerfile"
+grep -Eq '^FROM node:22-trixie-slim@sha256:[a-f0-9]{64}$' "$fly_dockerfile"
+grep -Fq 'ENTRYPOINT ["/app/build-fly.sh"]' "$fly_dockerfile"
+grep -Fq 'AF_BUILD_PHASE=clone' "$fly_phases"
+grep -Fq 'AF_BUILD_PHASE=build' "$fly_phases"
+grep -Fq 'AF_BUILD_PHASE=publish' "$fly_entrypoint"
+grep -Fq -- '-u GHCR_TOKEN' "$fly_phases"
+grep -Fq -- '-u CALLBACK_TOKEN' "$fly_phases"
+grep -Fq -- '-u REPO_CLONE_URL' "$fly_phases"
+grep -Fq 'AF_BUILD_TIMEOUT_SECONDS' "$fly_entrypoint"
 if grep -E '^[[:space:]]*FROM [^[:space:]]+(:[^@[:space:]]+)?([[:space:]]+AS[[:space:]]|$)' \
     "$root/scripts/render-dockerfile.sh" "$dockerfile" | grep -Ev '@sha256:[a-f0-9]{64}([[:space:]]+AS[[:space:]]|$)'; then
   echo 'mutable generated Dockerfile base image is forbidden' >&2

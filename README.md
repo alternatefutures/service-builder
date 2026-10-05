@@ -37,8 +37,15 @@ containers:
 The pod does not share process namespaces and does not mount a service-account
 token. Tenant-controlled Dockerfiles and build commands cannot read the clone,
 registry, or callback credentials through environment, process inspection, or
-a shared Docker control socket. The Fly single-machine executor is rejected by
-the API because it cannot provide this isolation boundary.
+a shared Docker control socket.
+
+`Dockerfile.fly` is the compatibility executor used while the production API
+still dispatches ephemeral Fly Machines. It runs the same clone, build, and
+publish phases in sequence, strips clone, registry, and callback credentials
+from the build phase's child environment, and enforces a hard runtime cap. It
+publishes under an immutable `-fly` tag in the public platform-builder package;
+customer source repositories and resulting application images remain private.
+The Kubernetes executor above remains the preferred stronger isolation model.
 
 ## Build + push the image
 

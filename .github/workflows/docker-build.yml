@@ -34,3 +34,13 @@ jobs:
           push: false
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Build Fly executor without publishing (linux/amd64)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: ./Dockerfile.fly
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha,scope=fly
+          cache-to: type=gha,mode=max,scope=fly
