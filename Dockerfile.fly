@@ -55,11 +55,13 @@ COPY --from=docker-engine /usr/local/libexec/docker/cli-plugins/docker-buildx /u
 
 WORKDIR /app
 COPY scripts/build.sh /app/build.sh
+COPY scripts/buildx-driver.sh /app/buildx-driver.sh
 COPY scripts/build-fly.sh /app/build-fly.sh
 COPY scripts/build-fly-phases.sh /app/build-fly-phases.sh
 COPY scripts/render-dockerfile.sh /app/render-dockerfile.sh
 RUN chmod 0555 \
     /app/build.sh \
+    /app/buildx-driver.sh \
     /app/build-fly.sh \
     /app/build-fly-phases.sh \
     /app/render-dockerfile.sh
