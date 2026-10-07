@@ -44,6 +44,12 @@ done
 
 unset DOCKER_HOST
 export AF_BUILD_RESULT_DIR="$RESULT_DIR"
+# A Fly Machine already runs its own Docker daemon inside a Firecracker VM.
+# Reuse that daemon's built-in BuildKit driver instead of launching the
+# docker-container driver, whose nested OverlayFS mount is rejected by the
+# Fly guest kernel. Kubernetes builds do not use this entrypoint and retain
+# their separate rootless BuildKit path.
+export BUILDX_BUILDER=default
 
 BUILD_TIMEOUT="${AF_BUILD_TIMEOUT_SECONDS:-900}"
 KILL_GRACE="${TIMEOUT_KILL_GRACE:-30}"

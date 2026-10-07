@@ -21,6 +21,10 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=buildx-driver.sh
+source "$SCRIPT_DIR/buildx-driver.sh"
+
 PHASE="${AF_BUILD_PHASE:-build}"
 RESULT_DIR="${AF_BUILD_RESULT_DIR:-/results}"
 LOG_FILE="$RESULT_DIR/build.log"
@@ -370,16 +374,7 @@ BUILDX_BUILDER="${BUILDX_BUILDER:-af-buildkit}"
 # (GC'd); `create` is a no-op if the named builder already exists, so
 # we try `use` first and only `create` on a clean miss. This keeps
 # fresh-volume bootstrap working without a separate init step.
-if ! docker buildx use "$BUILDX_BUILDER" >/dev/null 2>&1; then
-    echo "[builder] creating docker-container buildx builder: $BUILDX_BUILDER"
-    docker buildx create \
-        --driver docker-container \
-        --name "$BUILDX_BUILDER" \
-        --use \
-        --bootstrap >/dev/null
-else
-    echo "[builder] reusing existing buildx builder: $BUILDX_BUILDER"
-fi
+select_buildx_builder "$BUILDX_BUILDER"
 
 # Print the local builder configuration so daemon/driver failures are visible.
 docker buildx inspect "$BUILDX_BUILDER" --bootstrap | sed 's/^/[builder] buildx: /' || true
@@ -393,15 +388,12 @@ echo "[builder] running credential-free docker buildx build --load"
 # on a deployed service should tell you exactly which commit built it
 # without cross-referencing BuildJob rows.
 BUILD_START_MS=$(date +%s%3N)
-docker buildx build \
-    --builder "$BUILDX_BUILDER" \
-    --file "$DOCKERFILE_PATH" \
-    --platform linux/amd64 \
-    --tag "$IMAGE_TAG" \
-    --label "org.opencontainers.image.source=$REPO_SOURCE_URL" \
-    --label "org.opencontainers.image.revision=$REPO_REF" \
-    --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --load \
+run_buildx_build \
+    "$BUILDX_BUILDER" \
+    "$DOCKERFILE_PATH" \
+    "$IMAGE_TAG" \
+    "$REPO_SOURCE_URL" \
+    "$REPO_REF" \
     "$SRC_DIR"
 BUILD_END_MS=$(date +%s%3N)
 BUILD_DURATION_MS=$((BUILD_END_MS - BUILD_START_MS))
