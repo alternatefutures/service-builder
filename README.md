@@ -47,6 +47,21 @@ publishes under an immutable `-fly` tag in the public platform-builder package;
 customer source repositories and resulting application images remain private.
 The Kubernetes executor above remains the preferred stronger isolation model.
 
+Both production and staging run `BUILD_EXECUTOR=fly` today
+(`infra/k8s/api/configmap*.yaml`); `alternate-clouds-api/src/services/github/flyioBuilder.ts`
+spawns one Fly Machine per build from the digest-pinned
+`VERIFIED_FLY_BUILDER_IMAGE`, built from `Dockerfile.fly` at commit `abb3d4d`
+(Docker 29.8.2 + the `docker-container` buildx driver). Two newer commits on
+`fix/fly-docker-buildx-driver` (`cced983`, `fbce461`, adding
+`scripts/buildx-driver.sh`) are not in any published image yet.
+
+Fly builders need a persistent cache volume (`FLY_BUILDER_CACHE_VOLUME`):
+dockerd's data-root must live on the ext4 volume, because the Firecracker
+rootfs is refused as an overlayfs upperdir and buildkit dies at boot. A volume
+Fly no longer knows fails the spawn (`FlyBuilderConfigError`) instead of
+falling back to an ephemeral data-root (2026-10-15 incident, Phase 111 in
+`admin/cloud/docs/AF_DEVELOPMENT_PROCESS.md`).
+
 ## Build + push the image
 
 ```bash
