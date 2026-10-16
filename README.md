@@ -62,6 +62,30 @@ Fly no longer knows fails the spawn (`FlyBuilderConfigError`) instead of
 falling back to an ephemeral data-root (2026-10-15 incident, Phase 111 in
 `admin/cloud/docs/AF_DEVELOPMENT_PROCESS.md`).
 
+### Cache-volume housekeeping (2026-10-17, Phase 119)
+
+Nothing pruned the data-root until now, so a 20 GB pool volume filled within a
+day of ML builds and three hackathon builds died with `no space left on device`
+(2026-10-16). `build-fly.sh` now checks the volume's free space after dockerd
+is up and BEFORE the build (never during one: the volume is single-attach and
+this machine is its only user) and, under the minimum, prunes:
+
+| Var | Default | What |
+|---|---|---|
+| `AF_CACHE_MIN_FREE_GB` | `8` | Prune when the volume has less than this free |
+| `AF_CACHE_PRUNE_KEEP_GB` | `6` | `docker buildx prune --builder af-buildkit --all --force --reserved-space=<N>GB` (Docker 29 has no `--keep-storage`; the cache lives in the docker-container builder's state volume, so the builder is named explicitly) |
+| `AF_CACHE_PRUNE_IMAGE_AGE_HOURS` | `24` | `docker image prune --all --force --filter until=<N>h` |
+
+Before/after free GB are printed as `[build-fly] cache prune done: 3.1 GB ->
+12.4 GB free` and recorded in the `[builder] telemetry` line
+(`cache_prune_free_gb_before` / `cache_prune_free_gb_after`, `null` when no
+prune ran). The API forwards `FLY_BUILDER_CACHE_MIN_FREE_GB`,
+`FLY_BUILDER_CACHE_PRUNE_KEEP_GB` and `FLY_BUILDER_CACHE_PRUNE_IMAGE_AGE_HOURS`
+from its configmap into these machine env vars when set. The pinned
+`VERIFIED_FLY_BUILDER_IMAGE` predates this step: it takes effect only once the
+Fly image is rebuilt from this commit and re-pinned in `flyioBuilder.ts` and
+both API configmaps.
+
 ## Build + push the image
 
 ```bash
@@ -94,3 +118,6 @@ CI workflow lives at `service-builder/.github/workflows/docker-build.yml`
 | `BUILD_COMMAND_B64` | optional base64-encoded build-command override |
 | `START_COMMAND_B64` | optional base64-encoded start-command override |
 | `DOCKER_HOST` | Publisher only; `unix:///var/run/af-docker/docker.sock` |
+| `AF_CACHE_ROOT` | Fly only; mount path of the attached cache volume (dockerd data-root lives in `<root>/dockerd`) |
+| `AF_BUILD_TIMEOUT_SECONDS` | Fly only; runtime cap enforced by `build-fly.sh` (default 900) |
+| `AF_CACHE_MIN_FREE_GB` / `AF_CACHE_PRUNE_KEEP_GB` / `AF_CACHE_PRUNE_IMAGE_AGE_HOURS` | Fly only; pre-build prune thresholds (see "Cache-volume housekeeping") |

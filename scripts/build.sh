@@ -424,6 +424,10 @@ BUILD_DURATION_MS=$((BUILD_END_MS - BUILD_START_MS))
 #                    to missing persistence so we don't go hunting.
 #   cache_disk_gb  — available GB on the volume (or NaN if ephemeral);
 #                    early warning for full-volume cliffs.
+#   cache_prune_free_gb_before / cache_prune_free_gb_after
+#                  — free GB on the volume before and after the pre-build
+#                    prune in build-fly.sh (null when no prune ran: enough
+#                    free space, no volume, or the Kubernetes path).
 #   image_size_mb  — pushed manifest size (rough; we grab the first
 #                    layer's digest for a size estimate).
 CACHE_DISK_GB="null"
@@ -439,12 +443,14 @@ else
     BUILD_PHASE="nixpacks"
 fi
 
-printf '[builder] telemetry: {"phase":"%s","framework":"%s","duration_ms":%d,"cache_root":"%s","cache_disk_gb":%s}\n' \
+printf '[builder] telemetry: {"phase":"%s","framework":"%s","duration_ms":%d,"cache_root":"%s","cache_disk_gb":%s,"cache_prune_free_gb_before":%s,"cache_prune_free_gb_after":%s}\n' \
     "$BUILD_PHASE" \
     "$DETECTED_FRAMEWORK" \
     "$BUILD_DURATION_MS" \
     "$CACHE_ROOT_LABEL" \
-    "$CACHE_DISK_GB"
+    "$CACHE_DISK_GB" \
+    "${AF_CACHE_PRUNE_FREE_GB_BEFORE:-null}" \
+    "${AF_CACHE_PRUNE_FREE_GB_AFTER:-null}"
 
 echo "[builder:build] success; handing image to isolated publisher"
 docker save --output "$IMAGE_ARCHIVE.tmp" "$IMAGE_TAG"

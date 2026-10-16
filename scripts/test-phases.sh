@@ -52,6 +52,26 @@ grep -Fq -- '-u GHCR_TOKEN' "$fly_phases"
 grep -Fq -- '-u CALLBACK_TOKEN' "$fly_phases"
 grep -Fq -- '-u REPO_CLONE_URL' "$fly_phases"
 grep -Fq 'AF_BUILD_TIMEOUT_SECONDS' "$fly_entrypoint"
+# Pre-build cache prune (Phase 119): runs before the build, never during it,
+# with the Docker 29 flag set (--keep-storage is gone; --reserved-space is
+# its replacement) against the docker-container builder that holds the cache.
+grep -Fq 'AF_CACHE_MIN_FREE_GB' "$fly_entrypoint"
+grep -Fq 'docker buildx prune --builder "$BUILDX_BUILDER" --all --force' "$fly_entrypoint"
+grep -Fq -- '--reserved-space="${KEEP_GB}GB"' "$fly_entrypoint"
+grep -Fq 'docker image prune --all --force --filter "until=${IMAGE_AGE_HOURS}h"' "$fly_entrypoint"
+grep -Fq 'export AF_CACHE_PRUNE_FREE_GB_BEFORE=' "$fly_entrypoint"
+grep -Fq 'export AF_CACHE_PRUNE_FREE_GB_AFTER=' "$fly_entrypoint"
+grep -Fq '"cache_prune_free_gb_before":%s,"cache_prune_free_gb_after":%s' "$script"
+if grep -Fq -- '--keep-storage' "$fly_entrypoint" "$script"; then
+  echo 'docker 29 removed --keep-storage from builder prune; use --reserved-space' >&2
+  exit 1
+fi
+prune_line=$(grep -n 'docker buildx prune' "$fly_entrypoint" | head -n1 | cut -d: -f1)
+build_line=$(grep -n '/app/build-fly-phases.sh' "$fly_entrypoint" | tail -n1 | cut -d: -f1)
+if [ -z "$prune_line" ] || [ -z "$build_line" ] || [ "$prune_line" -ge "$build_line" ]; then
+  echo 'cache prune must run before the build phases, never alongside them' >&2
+  exit 1
+fi
 if grep -E '^[[:space:]]*FROM [^[:space:]]+(:[^@[:space:]]+)?([[:space:]]+AS[[:space:]]|$)' \
     "$root/scripts/render-dockerfile.sh" "$dockerfile" | grep -Ev '@sha256:[a-f0-9]{64}([[:space:]]+AS[[:space:]]|$)'; then
   echo 'mutable generated Dockerfile base image is forbidden' >&2
