@@ -56,6 +56,10 @@ grep -Fq 'if [ "$PHASE" = "plan" ]' "$script"
 grep -Fq 'build plan ready for rootless BuildKit' "$script"
 grep -Fq 'cp "$SRC_DIR/Dockerfile" "$TEMPLATE_PATH.tmp"' "$script"
 grep -Fq 'cp "$SRC_DIR/.nixpacks/Dockerfile" "$TEMPLATE_PATH.tmp"' "$script"
+# A failed nixpacks plan names the likely cause in the build log (2026-10-17:
+# an app in a subfolder with the service root directory left at ".").
+grep -Fq 'if ! nixpacks "${NIXPACKS_ARGS[@]}"; then' "$script"
+grep -Fq 'No app detected at the repo root. If your app lives in a subfolder, set Root directory on the service to that folder.' "$script"
 grep -Eq '^FROM node:22-trixie-slim@sha256:[a-f0-9]{64}$' "$dockerfile"
 grep -Eq '^FROM docker:29\.8\.2-cli@sha256:[a-f0-9]{64} AS docker-cli$' "$dockerfile"
 grep -Eq '^# syntax=docker/dockerfile:1\.7@sha256:[a-f0-9]{64}$' "$dockerfile"

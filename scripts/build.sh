@@ -337,7 +337,25 @@ else
     [ -n "${START_COMMAND:-}" ] && NIXPACKS_ARGS+=("--start-cmd" "$START_COMMAND")
 
     echo "[builder] planning with: nixpacks ${NIXPACKS_ARGS[*]}"
-    nixpacks "${NIXPACKS_ARGS[@]}"
+    if ! nixpacks "${NIXPACKS_ARGS[@]}"; then
+        # Nixpacks found nothing it knows how to build in $SRC_DIR. The usual
+        # cause (hackathon 2026-10-17: a repo whose app lived in a subfolder
+        # while the service's root directory stayed at ".") is a wrong root
+        # directory, so the build log says so in plain words, with the
+        # folders that exist at that level. The result JSON keeps its shape:
+        # the `false` below trips the ERR trap exactly like the nixpacks exit
+        # did before ("credential-free build phase crashed (line N)").
+        if [ "$ROOT_DIRECTORY" = "." ]; then
+            echo "No app detected at the repo root. If your app lives in a subfolder, set Root directory on the service to that folder."
+        else
+            echo "No app detected in root directory '$ROOT_DIRECTORY'. Set Root directory on the service to the folder that holds your app."
+        fi
+        SUBFOLDERS="$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -exec basename {} \; 2>/dev/null | sort | head -n 20 | tr '\n' ' ' || true)"
+        if [ -n "$SUBFOLDERS" ]; then
+            echo "Folders found there: $SUBFOLDERS"
+        fi
+        false
+    fi
 
     if [ ! -f "$SRC_DIR/.nixpacks/Dockerfile" ]; then
         echo "[builder] ERROR: nixpacks produced no Dockerfile at $SRC_DIR/.nixpacks/Dockerfile" >&2
