@@ -1,0 +1,18 @@
+# BuildKit daemon config for the persistent `af-buildkit` docker-container
+# builder (Fly executor). Copied into the image at /app/buildkitd.toml and
+# passed to `docker buildx create --buildkitd-config` by build.sh; build-fly.sh
+# recreates the builder container when this file or the pinned BuildKit image
+# changes (fingerprint on the cache volume), because BuildKit reads it only
+# when the container is created.
+#
+# The builder's state volume lives in dockerd's data-root on the attached
+# cache volume (63 GB on the prod pool). These bounds make the layer cache a
+# fixed-size LRU instead of "whatever fits": GC starts above maxUsedSpace or
+# below minFreeSpace and never prunes under reservedSpace. The cache is the
+# only thing that grows on the volume now that builds export an OCI layout to
+# the ephemeral rootfs instead of loading images into dockerd.
+[worker.oci]
+  gc = true
+  reservedSpace = "20GB"
+  maxUsedSpace = "40GB"
+  minFreeSpace = "12GB"

@@ -14,6 +14,8 @@ FROM node:22-trixie-slim@sha256:b26b04c123d9ff8ab646ceb18b9d75a1173acf64b9a40109
 
 ARG NIXPACKS_VERSION=1.41.0
 ARG NIXPACKS_SHA256=194bcad8c379f78a309eee1a88b2e6b2abc59f354efe7ecd7b4bbaf21de99a06
+ARG CRANE_VERSION=0.22.1
+ARG CRANE_SHA256=0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0
 
 # System dependencies plus pinned Docker CLI/buildx binaries copied from the
 # official digest-pinned image. The trusted publisher talks to its private dind.
@@ -45,7 +47,15 @@ RUN chmod 0755 /etc/ssl /etc/ssl/certs \
     && tar -xzf /tmp/nixpacks.tar.gz -C /usr/local/bin nixpacks \
     && chmod 0755 /usr/local/bin/nixpacks \
     && rm -f /tmp/nixpacks.tar.gz \
-    && nixpacks --version
+    && nixpacks --version \
+    && curl --proto '=https' --tlsv1.2 -fsSL \
+        -o /tmp/crane.tar.gz \
+        "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+    && echo "${CRANE_SHA256}  /tmp/crane.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/crane.tar.gz -C /usr/local/bin crane \
+    && chmod 0755 /usr/local/bin/crane \
+    && rm -f /tmp/crane.tar.gz \
+    && crane version
 
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker-cli /usr/local/libexec/docker/cli-plugins/docker-buildx /usr/local/libexec/docker/cli-plugins/docker-buildx

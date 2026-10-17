@@ -12,12 +12,18 @@
 #   REPO_CLONE_URL       — https://x-access-token:<token>@github.com/owner/repo.git
 #   REPO_REF             — branch name OR full commit sha to check out
 #   IMAGE_TAG            — ghcr.io/<org>/<userid>--<repo>:<sha>
-#   GHCR_USER            — username for `docker login ghcr.io`
+#   GHCR_USER            — registry username (`crane auth login`)
 #   GHCR_TOKEN           — PAT or App installation token with packages:write
 #   ROOT_DIRECTORY       — optional, monorepo subdir (defaults to ".")
 #   BUILD_COMMAND_B64    — optional base64-encoded build command override
 #   START_COMMAND_B64    — optional base64-encoded start command override
-#   DOCKER_HOST          — publisher-only socket for its isolated dind sidecar
+#   BUILDKIT_IMAGE       — optional (Fly sets it), digest-pinned BuildKit image
+#                          for the docker-container builder
+#   BUILDKITD_CONFIG     — optional (Fly sets it), buildkitd.toml with the GC
+#                          policy that bounds the layer cache
+#   DOCKER_HOST          — Kubernetes publisher sidecar socket; the publish
+#                          phase no longer needs a daemon (crane pushes the
+#                          artifact directly), kept for the pod template
 
 set -euo pipefail
 
@@ -25,6 +31,12 @@ PHASE="${AF_BUILD_PHASE:-build}"
 RESULT_DIR="${AF_BUILD_RESULT_DIR:-/results}"
 LOG_FILE="$RESULT_DIR/build.log"
 RESULT_FILE="$RESULT_DIR/result.json"
+# Image artifact handed from the credential-free build phase to the trusted
+# publisher. The Fly executor writes an OCI image layout (directory); the
+# Kubernetes rootless BuildKit writes a docker-style tarball. Neither is ever
+# loaded into a Docker daemon: every loaded image used to stay in dockerd's
+# store on the persistent cache volume (2026-10-17, Phase 119 addendum).
+IMAGE_LAYOUT="$RESULT_DIR/image"
 IMAGE_ARCHIVE="$RESULT_DIR/image.tar"
 PLAN_FILE="$RESULT_DIR/plan.json"
 PLAN_READY="$RESULT_DIR/plan.ready"
@@ -101,19 +113,31 @@ if [ "$PHASE" = "publish" ]; then
         post_callback FAILED "\"errorMessage\":$error"
         exit 1
     fi
-    if [ ! -s "$IMAGE_ARCHIVE" ]; then
-        post_callback FAILED '"errorMessage":"credential-free build produced no image archive"'
+    if [ -f "$IMAGE_LAYOUT/index.json" ]; then
+        ARTIFACT="$IMAGE_LAYOUT"
+    elif [ -s "$IMAGE_ARCHIVE" ]; then
+        ARTIFACT="$IMAGE_ARCHIVE"
+    else
+        post_callback FAILED '"errorMessage":"credential-free build produced no image artifact"'
         exit 66
     fi
-    if ! docker load --input "$IMAGE_ARCHIVE" >>"$LOG_FILE" 2>&1; then
-        post_callback FAILED '"errorMessage":"trusted publisher could not load the built image archive"'
+    # crane pushes the artifact straight to the registry: no daemon, no
+    # `docker load`, nothing left behind on the builder. The login lives in a
+    # throwaway DOCKER_CONFIG so the token never lands in a shared config.
+    REGISTRY_HOST="${IMAGE_TAG%%/*}"
+    DOCKER_CONFIG="$(mktemp -d)"
+    export DOCKER_CONFIG
+    if ! printf '%s' "$GHCR_TOKEN" | crane auth login "$REGISTRY_HOST" -u "$GHCR_USER" --password-stdin >>"$LOG_FILE" 2>&1; then
+        rm -rf "$DOCKER_CONFIG"
+        post_callback FAILED '"errorMessage":"trusted registry login failed"'
         exit 1
     fi
-    echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin >/dev/null
-    if ! docker push "$IMAGE_TAG" >>"$LOG_FILE" 2>&1; then
+    if ! crane push "$ARTIFACT" "$IMAGE_TAG" >>"$LOG_FILE" 2>&1; then
+        rm -rf "$DOCKER_CONFIG"
         post_callback FAILED '"errorMessage":"trusted registry publish failed"'
         exit 1
     fi
+    rm -rf "$DOCKER_CONFIG" "$IMAGE_LAYOUT" "$IMAGE_ARCHIVE"
     extra=$(jq -r '
       {imageTag:env.IMAGE_TAG,commitSha:.commitSha,detectedFramework:.detectedFramework}
       + (if .detectedPort == null then {} else {detectedPort:.detectedPort} end)
@@ -370,13 +394,20 @@ BUILDX_BUILDER="${BUILDX_BUILDER:-af-buildkit}"
 # (GC'd); `create` is a no-op if the named builder already exists, so
 # we try `use` first and only `create` on a clean miss. This keeps
 # fresh-volume bootstrap working without a separate init step.
+# The Fly executor pins the BuildKit image by digest and ships a daemon config
+# with the GC policy that bounds the layer cache (scripts/buildkitd.toml).
+# BuildKit reads both only when the builder container is created; build-fly.sh
+# recreates the container when either changes. Unset on the Kubernetes path.
+BUILDX_CREATE_ARGS=(--driver docker-container --name "$BUILDX_BUILDER" --use --bootstrap)
+if [ -n "${BUILDKIT_IMAGE:-}" ]; then
+    BUILDX_CREATE_ARGS+=(--driver-opt "image=$BUILDKIT_IMAGE")
+fi
+if [ -n "${BUILDKITD_CONFIG:-}" ]; then
+    BUILDX_CREATE_ARGS+=(--buildkitd-config "$BUILDKITD_CONFIG")
+fi
 if ! docker buildx use "$BUILDX_BUILDER" >/dev/null 2>&1; then
     echo "[builder] creating docker-container buildx builder: $BUILDX_BUILDER"
-    docker buildx create \
-        --driver docker-container \
-        --name "$BUILDX_BUILDER" \
-        --use \
-        --bootstrap >/dev/null
+    docker buildx create "${BUILDX_CREATE_ARGS[@]}" >/dev/null
 else
     echo "[builder] reusing existing buildx builder: $BUILDX_BUILDER"
 fi
@@ -384,7 +415,7 @@ fi
 # Print the local builder configuration so daemon/driver failures are visible.
 docker buildx inspect "$BUILDX_BUILDER" --bootstrap | sed 's/^/[builder] buildx: /' || true
 
-echo "[builder] running credential-free docker buildx build --load"
+echo "[builder] running credential-free docker buildx build (OCI layout output; nothing is loaded into dockerd)"
 # --label org.opencontainers.image.source: stamped so GHCR auto-links
 # this container package to the source GitHub repo on push. Label
 # value is the clean https URL (no auth token), safe to embed.
@@ -392,7 +423,13 @@ echo "[builder] running credential-free docker buildx build --load"
 # image.revision / image.created are included because `docker inspect`
 # on a deployed service should tell you exactly which commit built it
 # without cross-referencing BuildJob rows.
+# --output type=oci: BuildKit exports the image as an OCI layout on the
+# ephemeral rootfs and the publisher pushes it with crane. The image never
+# enters dockerd's store (which lives on the persistent cache volume).
+# --provenance=false keeps the layout a single image manifest, the same shape
+# `docker push` produced before.
 BUILD_START_MS=$(date +%s%3N)
+rm -rf "$IMAGE_LAYOUT.tmp"
 docker buildx build \
     --builder "$BUILDX_BUILDER" \
     --file "$DOCKERFILE_PATH" \
@@ -401,7 +438,8 @@ docker buildx build \
     --label "org.opencontainers.image.source=$REPO_SOURCE_URL" \
     --label "org.opencontainers.image.revision=$REPO_REF" \
     --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    --load \
+    --provenance=false \
+    --output "type=oci,dest=$IMAGE_LAYOUT.tmp,tar=false" \
     "$SRC_DIR"
 BUILD_END_MS=$(date +%s%3N)
 BUILD_DURATION_MS=$((BUILD_END_MS - BUILD_START_MS))
@@ -452,9 +490,9 @@ printf '[builder] telemetry: {"phase":"%s","framework":"%s","duration_ms":%d,"ca
     "${AF_CACHE_PRUNE_FREE_GB_BEFORE:-null}" \
     "${AF_CACHE_PRUNE_FREE_GB_AFTER:-null}"
 
-echo "[builder:build] success; handing image to isolated publisher"
-docker save --output "$IMAGE_ARCHIVE.tmp" "$IMAGE_TAG"
-mv "$IMAGE_ARCHIVE.tmp" "$IMAGE_ARCHIVE"
+echo "[builder:build] success; handing the OCI image layout to the isolated publisher"
+rm -rf "$IMAGE_LAYOUT"
+mv "$IMAGE_LAYOUT.tmp" "$IMAGE_LAYOUT"
 jq -n \
     --arg sha "$ACTUAL_SHA" \
     --arg fw "$DETECTED_FRAMEWORK" \

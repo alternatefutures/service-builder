@@ -3,7 +3,7 @@ name: af-builder-publish
 on:
   push:
     branches: [main]
-    paths: ['Dockerfile', 'scripts/**', '.github/workflows/docker-publish.yml']
+    paths: ['Dockerfile', 'Dockerfile.fly', 'scripts/**', '.github/workflows/docker-publish.yml']
 
 concurrency:
   group: af-builder-publish

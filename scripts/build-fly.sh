@@ -46,17 +46,45 @@ unset DOCKER_HOST
 export AF_BUILD_RESULT_DIR="$RESULT_DIR"
 
 # ---------------------------------------------------------------------------
+# Pinned BuildKit + bounded layer cache (2026-10-17, Phase 119 addendum).
+# ---------------------------------------------------------------------------
+# build.sh creates the persistent `af-buildkit` docker-container builder with
+# this digest-pinned image and this daemon config (GC policy: reservedSpace /
+# maxUsedSpace / minFreeSpace, so the cache is a fixed-size LRU on the
+# volume). BuildKit reads both only when the builder container is created, so
+# a change to either recreates the container and its state volume (the layer
+# cache starts cold once). The fingerprint on the cache volume records what
+# the existing container was created with.
+export BUILDKIT_IMAGE="${BUILDKIT_IMAGE:-moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8}"
+export BUILDKITD_CONFIG="${BUILDKITD_CONFIG:-/app/buildkitd.toml}"
+BUILDX_BUILDER="${BUILDX_BUILDER:-af-buildkit}"
+export BUILDX_BUILDER
+if [ -n "${AF_CACHE_ROOT:-}" ] && mountpoint -q "$AF_CACHE_ROOT" && [ -f "$BUILDKITD_CONFIG" ]; then
+    builder_fingerprint="$( { printf '%s\n' "$BUILDKIT_IMAGE"; cat "$BUILDKITD_CONFIG"; } | sha256sum | cut -d' ' -f1)"
+    fingerprint_file="$AF_CACHE_ROOT/buildkit.fingerprint"
+    if docker container inspect "buildx_buildkit_${BUILDX_BUILDER}0" >/dev/null 2>&1 \
+        && [ "$(cat "$fingerprint_file" 2>/dev/null || true)" != "$builder_fingerprint" ]; then
+        echo "[build-fly] BuildKit image or daemon config changed; recreating builder ${BUILDX_BUILDER} (layer cache starts cold)"
+        docker rm -f "buildx_buildkit_${BUILDX_BUILDER}0" >/dev/null 2>&1 || true
+        docker volume rm -f "buildx_buildkit_${BUILDX_BUILDER}0_state" >/dev/null 2>&1 || true
+    fi
+    printf '%s\n' "$builder_fingerprint" >"$fingerprint_file.tmp" && mv "$fingerprint_file.tmp" "$fingerprint_file"
+fi
+
+# ---------------------------------------------------------------------------
 # Cache-volume housekeeping (2026-10-16 ENOSPC incident, Phase 119).
 # ---------------------------------------------------------------------------
-# Nothing else ever prunes dockerd's data-root on the persistent cache volume:
-# every build leaves its image, buildkit snapshots and cache mounts behind, so
-# a 20 GB volume fills within a day of ML builds and the next build dies with
-# "no space left on device" halfway through pip install or the image import.
-# Before the build, and ONLY before it (the volume is single-attach, this
-# machine is its only user and nothing is being built yet), read the free
-# space and, under AF_CACHE_MIN_FREE_GB, prune the buildkit cache of the
-# docker-container builder down to AF_CACHE_PRUNE_KEEP_GB and drop unused
-# images older than AF_CACHE_PRUNE_IMAGE_AGE_HOURS. Before/after free GB are
+# Safety net under the BuildKit GC policy above. Builds no longer load images
+# into dockerd (OCI layout output + crane push), so on a volume created after
+# 2026-10-17 the only thing that grows is the builder's state volume, which
+# the GC policy bounds. This block still matters for: volumes that carry
+# images leaked by earlier builder images (the image prune clears them on the
+# first low-space run), and a GC policy that could not keep up. Before the
+# build, and ONLY before it (the volume is single-attach, this machine is its
+# only user and nothing is being built yet), read the free space and, under
+# AF_CACHE_MIN_FREE_GB, prune the buildkit cache of the docker-container
+# builder down to AF_CACHE_PRUNE_KEEP_GB and drop unused images older than
+# AF_CACHE_PRUNE_IMAGE_AGE_HOURS (default 1 h). Before/after free GB are
 # exported so the `[builder] telemetry` line in build.sh records them next to
 # cache_disk_gb.
 #
@@ -82,8 +110,7 @@ CACHE_PRUNE_FREE_GB_AFTER="null"
 if [ -n "${AF_CACHE_ROOT:-}" ] && mountpoint -q "$AF_CACHE_ROOT"; then
     MIN_FREE_GB="$(uint_or_default "${AF_CACHE_MIN_FREE_GB:-}" 8)"
     KEEP_GB="$(uint_or_default "${AF_CACHE_PRUNE_KEEP_GB:-}" 6)"
-    IMAGE_AGE_HOURS="$(uint_or_default "${AF_CACHE_PRUNE_IMAGE_AGE_HOURS:-}" 24)"
-    BUILDX_BUILDER="${BUILDX_BUILDER:-af-buildkit}"
+    IMAGE_AGE_HOURS="$(uint_or_default "${AF_CACHE_PRUNE_IMAGE_AGE_HOURS:-}" 1)"
     min_free_bytes=$((MIN_FREE_GB * 1000000000))
     free_before="$(cache_free_bytes "$AF_CACHE_ROOT")"
     case "$free_before" in
@@ -102,7 +129,8 @@ if [ -n "${AF_CACHE_ROOT:-}" ] && mountpoint -q "$AF_CACHE_ROOT"; then
         # fresh volume: nothing to prune there.
         if docker container inspect "buildx_buildkit_${BUILDX_BUILDER}0" >/dev/null 2>&1; then
             if ! docker buildx inspect "$BUILDX_BUILDER" >/dev/null 2>&1; then
-                docker buildx create --driver docker-container --name "$BUILDX_BUILDER" --bootstrap >/dev/null 2>&1 \
+                docker buildx create --driver docker-container --name "$BUILDX_BUILDER" \
+                    --driver-opt "image=$BUILDKIT_IMAGE" --buildkitd-config "$BUILDKITD_CONFIG" --bootstrap >/dev/null 2>&1 \
                     || echo "[build-fly] could not attach to buildx builder $BUILDX_BUILDER for pruning" >&2
             fi
             timeout 300s docker buildx prune --builder "$BUILDX_BUILDER" --all --force \
@@ -111,7 +139,7 @@ if [ -n "${AF_CACHE_ROOT:-}" ] && mountpoint -q "$AF_CACHE_ROOT"; then
         else
             echo "[build-fly] no buildx builder container on this volume yet; skipping build-cache prune"
         fi
-        timeout 120s docker image prune --all --force --filter "until=${IMAGE_AGE_HOURS}h" 2>&1 | tail -n 1 | sed 's/^/[build-fly] image prune: /' \
+        timeout 300s docker image prune --all --force --filter "until=${IMAGE_AGE_HOURS}h" 2>&1 | tail -n 1 | sed 's/^/[build-fly] image prune: /' \
             || echo "[build-fly] image prune failed or timed out (continuing)" >&2
         free_after="$(cache_free_bytes "$AF_CACHE_ROOT")"
         case "$free_after" in
